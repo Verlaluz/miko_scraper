@@ -1,0 +1,26 @@
+# Exclude the build cache (huge, rebuilt inside Docker anyway)
+target/
+
+# Never bake real secrets into the image
+.env
+
+# Never bake the live database into the image (mount it as a volume)
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Git internals
+.git/
+.gitignore
+
+# Docker override files
+docker-compose.override.yml
+
+# Dev/scratch files
+*.html
+*.js
+index.js
+creativeawards_home.html
+nominee_alpha.json
+results.json
