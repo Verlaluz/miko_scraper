@@ -79,6 +79,22 @@ docker compose down --volumes
 docker compose up --build
 ```
 
+## GitHub Actions deployment
+
+The `Miko Scraper CI/CD` workflow builds the production image on pull requests
+and pushes to `master`. A production deployment runs after a successful build
+when the repository environment contains these secrets:
+
+- `DEPLOY_HOST` — deployment server hostname or IP
+- `DEPLOY_USER` — SSH user
+- `DEPLOY_SSH_KEY` — private key accepted by that user
+- `DEPLOY_PATH` — absolute path of this checkout on the deployment server
+
+The deployment keeps `.env` and `data/` untracked, backs up the SQLite database,
+rebuilds the image, and waits for the container health check to pass. The
+Telegram token and database must be configured on the deployment server; they
+are never stored in GitHub Actions.
+
 ---
 
 ## Database Safety

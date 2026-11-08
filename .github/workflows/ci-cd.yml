@@ -1,0 +1,76 @@
+name: Miko Scraper CI/CD
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: miko-scraper-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Build and validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate Compose configuration
+        run: |
+          cp .env.example .env
+          docker compose config
+
+      - name: Build production image
+        run: docker compose build miko_scraper
+
+  deploy:
+    name: Deploy production
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Load deployment SSH key
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Trust deployment host
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: ssh-keyscan -H "$DEPLOY_HOST" >> "$HOME/.ssh/known_hosts"
+
+      - name: Deploy and verify
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -eu
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "DEPLOY_PATH='$DEPLOY_PATH' bash -s" <<'REMOTE'
+          set -eu
+          cd "$DEPLOY_PATH"
+          git fetch origin master
+          git reset --hard origin/master
+          mkdir -p data/backups
+          if [ -f data/miko_scraper.db ]; then
+            cp data/miko_scraper.db "data/backups/miko_scraper-$(date -u +%Y%m%dT%H%M%SZ).db"
+          fi
+          docker compose up -d --build --remove-orphans
+          for attempt in $(seq 1 30); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' miko_scraper 2>/dev/null || true)"
+            if [ "$status" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs --tail=100
+          exit 1
+          REMOTE

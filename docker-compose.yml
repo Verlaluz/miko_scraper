@@ -9,7 +9,7 @@ services:
     # Map container port 3000 to host port 3000.
     # Change the left side (host) if something else is using port 3000.
     ports:
-      - "3000:3000"
+      - "3001:3000"
 
     # Load secrets from your local .env file — it is never baked into the image.
     # This covers APP_SECRET_KEY, TELOXIDE_TOKEN, RUST_LOG, etc.

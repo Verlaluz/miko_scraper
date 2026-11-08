@@ -1,8 +1,10 @@
 use crate::services::{AccountService, ScrapingService};
+use crate::services::scraping_service::AccountVoteStatus;
 use std::sync::Arc;
 use teloxide::{
     dispatching::dialogue::InMemStorage,
     prelude::*,
+    types::{InlineKeyboardButton, InlineKeyboardMarkup},
     utils::command::BotCommands,
 };
 
@@ -31,6 +33,12 @@ pub enum Command {
     Register,
     #[command(description = "View real-time voting eligibility for all accounts.")]
     Status,
+    #[command(description = "Show accounts eligible to vote now.")]
+    Eligible,
+    #[command(description = "Show accounts in voting cooldown.")]
+    Cooldown,
+    #[command(description = "Show bot and database health.")]
+    Health,
     #[command(description = "Cancel current operation and return to start.")]
     Cancel,
     #[command(description = "Help and command list.")]
@@ -49,18 +57,22 @@ pub fn start_telegram_bot(
             tracing::info!("Initializing Telegram Bot dispatcher...");
             let bot = Bot::new(token.clone());
 
-            let handler = Update::filter_message()
-                .enter_dialogue::<Message, InMemStorage<State>, State>()
+            let handler = dptree::entry()
+                .branch(Update::filter_callback_query().endpoint(handle_status_filter))
                 .branch(
-                    dptree::entry()
-                        .filter_command::<Command>()
-                        .endpoint(handle_command),
-                )
-                .branch(dptree::case![State::Start].endpoint(handle_start_text))
-                .branch(dptree::case![State::AwaitingPhoneNumber].endpoint(handle_phone_number))
-                .branch(
-                    dptree::case![State::AwaitingOtp { phone_number }]
-                        .endpoint(handle_otp_code),
+                    Update::filter_message()
+                        .enter_dialogue::<Message, InMemStorage<State>, State>()
+                        .branch(
+                            dptree::entry()
+                                .filter_command::<Command>()
+                                .endpoint(handle_command),
+                        )
+                        .branch(dptree::case![State::Start].endpoint(handle_start_text))
+                        .branch(dptree::case![State::AwaitingPhoneNumber].endpoint(handle_phone_number))
+                        .branch(
+                            dptree::case![State::AwaitingOtp { phone_number }]
+                                .endpoint(handle_otp_code),
+                        ),
                 );
 
             let mut dispatcher = Dispatcher::builder(bot, handler)
@@ -97,7 +109,10 @@ async fn handle_command(
                 Use this bot to register phone accounts, verify OTPs, and track 12-hour votes for family & friends.\n\n\
                 <b>Commands:</b>\n\
                 /register — Add a phone number & receive OTP\n\
-                /status — View eligibility of all registered accounts\n\
+                /status — View totals and choose an account\n\
+                /eligible — Show accounts ready to vote\n\
+                /cooldown — Show accounts in cooldown\n\
+                /health — Check bot and database health\n\
                 /cancel — Cancel current action\n\
                 /help — Show this help message";
             bot.send_message(msg.chat.id, welcome)
@@ -115,7 +130,7 @@ async fn handle_command(
             .parse_mode(teloxide::types::ParseMode::Html)
             .await?;
         }
-        Command::Status => {
+        Command::Status | Command::Eligible | Command::Cooldown => {
             let accounts = account_service.list_accounts().await?;
             if accounts.is_empty() {
                 bot.send_message(
@@ -127,27 +142,48 @@ async fn handle_command(
             }
 
             let statuses = scraping_service.get_all_accounts_vote_status(&accounts).await?;
-            let mut response = String::from("📊 <b>Family & Friends Voting Status:</b>\n\n");
-
-            for s in statuses {
-                let name = s.label.unwrap_or_else(|| format!("Account #{}", s.account_id));
-                let status_icon = if s.is_eligible {
-                    "🟢 <b>Ready to Vote</b>"
-                } else {
-                    let hours = s.remaining_seconds / 3600;
-                    let mins = (s.remaining_seconds % 3600) / 60;
-                    format!("🟡 <b>Cooldown ({}h {}m left)</b>", hours, mins).leak()
-                };
-
-                response.push_str(&format!(
-                    "👤 <b>{}</b> (<code>{}</code>)\nStatus: {}\n\n",
-                    name, s.phone_number, status_icon
-                ));
-            }
-
-            bot.send_message(msg.chat.id, response)
-                .parse_mode(teloxide::types::ParseMode::Html)
-                .await?;
+            let filtered_statuses: Vec<AccountVoteStatus> = match &cmd {
+                Command::Eligible => statuses
+                    .iter()
+                    .filter(|status| status.is_eligible)
+                    .cloned()
+                    .collect(),
+                Command::Cooldown => statuses
+                    .iter()
+                    .filter(|status| !status.is_eligible)
+                    .cloned()
+                    .collect(),
+                Command::Status => statuses.clone(),
+                _ => unreachable!("command is matched above"),
+            };
+            let show_filters = matches!(&cmd, Command::Status);
+            send_status_report(
+                &bot,
+                msg.chat.id,
+                &filtered_statuses,
+                Some(statuses.len()),
+                show_filters,
+                match &cmd {
+                    Command::Eligible => "eligible",
+                    Command::Cooldown => "cooldown",
+                    _ => "all",
+                },
+                0,
+                None,
+            )
+            .await?;
+        }
+        Command::Health => {
+            let accounts = account_service.list_accounts().await?;
+            bot.send_message(
+                msg.chat.id,
+                format!(
+                    "✅ <b>Miko Scraper is healthy</b>\n\nTelegram polling: active\nDatabase: connected\nRegistered accounts: {}",
+                    accounts.len()
+                ),
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
         }
         Command::Cancel => {
             dialogue.update(State::Start).await?;
@@ -155,6 +191,277 @@ async fn handle_command(
                 .await?;
         }
     }
+    Ok(())
+}
+
+async fn send_status_report(
+    bot: &Bot,
+    chat_id: ChatId,
+    statuses: &[AccountVoteStatus],
+    total_count: Option<usize>,
+    show_filters: bool,
+    filter: &str,
+    page: usize,
+    range: Option<usize>,
+) -> HandlerResult {
+    let eligible_count = statuses.iter().filter(|status| status.is_eligible).count();
+    let cooldown_count = statuses.len() - eligible_count;
+    let total_count = total_count.unwrap_or(statuses.len());
+    let mut report = format!(
+        "📊 Family & Friends Vote Eligibility\n\n\
+         Showing: {} of {} accounts\n\
+         🟢 Eligible now: {}\n\
+         🟡 Already voted / cooldown: {}\n",
+        statuses.len(),
+        total_count,
+        eligible_count,
+        cooldown_count,
+    );
+
+    let page_size = 20;
+    let visible_statuses = match range {
+        Some(10) => &statuses[..statuses.len().min(10)],
+        Some(20) => &statuses[..statuses.len().min(20)],
+        Some(100) => &statuses[statuses.len().min(20)..statuses.len().min(120)],
+        _ => statuses,
+    };
+    let page_count = ((visible_statuses.len() + page_size - 1) / page_size).max(1);
+    let page = page.min(page_count - 1);
+    let start = page * page_size;
+    let end = (start + page_size).min(visible_statuses.len());
+    report.push_str(&format!("\nPage {} of {}\n", page + 1, page_count));
+    for status in &visible_statuses[start..end] {
+        let label = status.label.as_deref().unwrap_or("Account");
+        report.push_str(&format!("• {} #{}\n", label, status.account_id));
+    }
+
+    let chunks = report
+        .lines()
+        .fold(Vec::<String>::new(), |mut chunks, line| {
+            const MAX_MESSAGE_LENGTH: usize = 3800;
+            if chunks
+                .last()
+                .map(|chunk| chunk.len() + line.len() + 1 <= MAX_MESSAGE_LENGTH)
+                .unwrap_or(false)
+            {
+                chunks.last_mut().unwrap().push('\n');
+                chunks.last_mut().unwrap().push_str(line);
+            } else {
+                chunks.push(line.to_string());
+            }
+            chunks
+        });
+
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let mut message = bot.send_message(chat_id, chunk);
+        if index == 0 {
+            message = message.reply_markup(status_keyboard(
+                &visible_statuses[start..end],
+                filter,
+                page,
+                page_count,
+                show_filters,
+                range,
+            ));
+        }
+        message.await?;
+    }
+
+    Ok(())
+}
+
+fn status_keyboard(
+    statuses: &[AccountVoteStatus],
+    filter: &str,
+    page: usize,
+    page_count: usize,
+    show_filters: bool,
+    range: Option<usize>,
+) -> InlineKeyboardMarkup {
+    let mut rows = if range.is_some() {
+        statuses
+            .chunks(2)
+            .map(|row| {
+                row.iter()
+                    .map(|status| {
+                        InlineKeyboardButton::callback(
+                            format!("Account #{}", status.account_id),
+                            format!("account:{}", status.account_id),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if page_count > 1 {
+        let mut navigation = Vec::new();
+        if page > 0 {
+            navigation.push(InlineKeyboardButton::callback(
+                "⬅️ Previous",
+                format!("status:{}:{}:{}", filter, page - 1, range.unwrap_or(0)),
+            ));
+        }
+        if page + 1 < page_count {
+            navigation.push(InlineKeyboardButton::callback(
+                "Next ➡️",
+                format!("status:{}:{}:{}", filter, page + 1, range.unwrap_or(0)),
+            ));
+        }
+        rows.push(navigation);
+    }
+    if show_filters && range.is_none() {
+        rows.push(vec![
+            InlineKeyboardButton::callback("Recent 10", "range:10"),
+            InlineKeyboardButton::callback("Recent 20", "range:20"),
+            InlineKeyboardButton::callback("Past 100", "range:100"),
+        ]);
+    }
+    if range.is_some() {
+        rows.push(vec![InlineKeyboardButton::callback("⬅️ Back to ranges", "range:0")]);
+    }
+    InlineKeyboardMarkup::new(rows)
+}
+
+async fn handle_status_filter(
+    bot: Bot,
+    query: CallbackQuery,
+    account_service: Arc<AccountService>,
+    scraping_service: Arc<ScrapingService>,
+) -> HandlerResult {
+    let data = query.data.clone().unwrap_or_else(|| "status:all:0".to_string());
+    if let Some(value) = data.strip_prefix("range:") {
+        return handle_status_range(
+            bot,
+            query,
+            account_service,
+            scraping_service,
+            value.parse::<usize>().ok(),
+        )
+        .await;
+    }
+    if let Some(account_id) = data.strip_prefix("account:").and_then(|id| id.parse().ok()) {
+        return handle_account_detail(bot, query, account_service, scraping_service, account_id).await;
+    }
+    let mut parts = data.split(':');
+    let _ = parts.next();
+    let filter = parts.next().unwrap_or("all");
+    let page = parts.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+    let range = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| matches!(value, 10 | 20 | 100));
+
+    bot.answer_callback_query(query.id).await?;
+
+    let Some(message) = query.message else {
+        return Ok(());
+    };
+
+    let accounts = account_service.list_accounts().await?;
+    let statuses = scraping_service
+        .get_all_accounts_vote_status(&accounts)
+        .await?;
+    let filtered: Vec<AccountVoteStatus> = match filter {
+        "eligible" => statuses
+            .iter()
+            .filter(|status| status.is_eligible)
+            .cloned()
+            .collect(),
+        "cooldown" => statuses
+            .iter()
+            .filter(|status| !status.is_eligible)
+            .cloned()
+            .collect(),
+        _ => statuses.clone(),
+    };
+
+    send_status_report(
+        &bot,
+        message.chat().id,
+        &filtered,
+        Some(statuses.len()),
+        true,
+        filter,
+        page,
+        range,
+    )
+    .await
+}
+
+async fn handle_status_range(
+    bot: Bot,
+    query: CallbackQuery,
+    account_service: Arc<AccountService>,
+    scraping_service: Arc<ScrapingService>,
+    range: Option<usize>,
+) -> HandlerResult {
+    bot.answer_callback_query(query.id).await?;
+    let Some(message) = query.message else {
+        return Ok(());
+    };
+    let accounts = account_service.list_accounts().await?;
+    let statuses = scraping_service.get_all_accounts_vote_status(&accounts).await?;
+    send_status_report(
+        &bot,
+        message.chat().id,
+        &statuses,
+        Some(statuses.len()),
+        true,
+        "all",
+        0,
+        range.filter(|value| matches!(value, 10 | 20 | 100)),
+    )
+    .await
+}
+
+async fn handle_account_detail(
+    bot: Bot,
+    query: CallbackQuery,
+    account_service: Arc<AccountService>,
+    scraping_service: Arc<ScrapingService>,
+    account_id: i64,
+) -> HandlerResult {
+    bot.answer_callback_query(query.id).await?;
+    let Some(message) = query.message else {
+        return Ok(());
+    };
+    let accounts = account_service.list_accounts().await?;
+    let statuses = scraping_service.get_all_accounts_vote_status(&accounts).await?;
+    let Some(status) = statuses.iter().find(|status| status.account_id == account_id) else {
+        bot.send_message(message.chat().id, "Account not found. Please request /status again.")
+            .await?;
+        return Ok(());
+    };
+    let status_text = if status.is_eligible {
+        "🟢 Eligible (ready to vote)".to_string()
+    } else {
+        format!(
+            "🟡 Already voted / cooldown\nRemaining: {}h {}m",
+            status.remaining_seconds / 3600,
+            (status.remaining_seconds % 3600) / 60
+        )
+    };
+    let label = status.label.as_deref().unwrap_or("Unnamed");
+    bot.send_message(
+        message.chat().id,
+        format!(
+            "👤 <b>Account #{}</b>\n\nLabel: {}\nPhone: <code>{}</code>\nStatus: {}\nLast vote: {}",
+            status.account_id,
+            label,
+            status.phone_number,
+            status_text,
+            status.last_vote_at
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "No recorded vote".to_string())
+        ),
+    )
+    .parse_mode(teloxide::types::ParseMode::Html)
+    .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("⬅️ Back to ranges", "range:0"),
+    ]]))
+    .await?;
     Ok(())
 }
 
