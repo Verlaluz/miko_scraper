@@ -1,0 +1,50 @@
+[package]
+name = "miko_scraper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async Runtime & Utilities
+tokio = { version = "1.40", features = ["full"] }
+
+# Web Framework & HTTP
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+
+# Database (SQLx for SQLite initially, easily extensible to Postgres)
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "chrono"
+] }
+
+# Serialization & Deserialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time & Date Handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Cryptography & Security
+aes-gcm = "0.10"
+rand = "0.8"
+hex = "0.4"
+
+# HTTP Client & Web Scraping
+reqwest = { version = "0.12", features = ["json", "cookies"] }
+scraper = "0.20"
+
+# Error Handling & Logging
+async-trait = "0.1"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+
+# Telegram Bot
+teloxide = { version = "0.13", features = ["macros"] }
+
+[dev-dependencies]
+tempfile = "3.12"

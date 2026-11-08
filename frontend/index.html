@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Miko Scraper - CreativeAwards Dashboard</title>
+    <link rel="stylesheet" href="/style.css?v=2">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="logo">
+                <span class="badge">RUST BACKEND</span>
+                <h1>CreativeAwards.et Authenticated Scraper</h1>
+            </div>
+            <p class="subtitle">Multi-Account OTP Authentication, 12-Hour Cooldown, and Encrypted Session Persistence</p>
+        </header>
+
+        <div class="grid">
+            <!-- 1. Phone Accounts & OTP Registration -->
+            <section class="card">
+                <h2>📱 Phone Accounts & Registration</h2>
+                <div class="form-group">
+                    <label for="phoneNumber">Ethiopian Phone Number</label>
+                    <div class="input-inline">
+                        <input type="tel" id="phoneNumber" placeholder="0946692896 or +2519..." autocomplete="tel">
+                        <button id="btnSendOtp" class="btn btn-primary">Send OTP</button>
+                    </div>
+                    <small>Sends official OTP to <code>api.creativeawards.et/api/send-otp</code></small>
+                </div>
+
+                <div id="otpSection" class="form-group hidden">
+                    <label for="otpCode">6-Digit SMS Code</label>
+                    <div class="input-inline">
+                        <input type="text" id="otpCode" placeholder="123456" maxlength="6">
+                        <button id="btnVerifyOtp" class="btn btn-accent">Verify & Save Session</button>
+                    </div>
+                    <small id="otpStatusMsg">Code sent. Enter the 6 digits received.</small>
+                </div>
+
+                <h3>Registered Accounts</h3>
+                <div class="table-container">
+                    <table id="accountsTable">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Label / Name</th>
+                                <th>Phone Number</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr><td colspan="5" class="text-center">Loading accounts...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- 2. Scraping Operations & Cooldown Control -->
+            <section class="card">
+                <h2>👥 Family & Friends Vote Eligibility Monitor</h2>
+                <p class="subtitle" style="margin-bottom: 12px;">See which accounts have already voted and which ones are eligible right now:</p>
+                
+                <div class="filter-bar" style="margin-bottom: 12px; display: flex; gap: 8px; justify-content: space-between; align-items: center;">
+                    <div style="display: flex; gap: 8px;">
+                        <button class="btn btn-primary btn-sm active" id="filterAll">All Accounts</button>
+                        <button class="btn btn-primary btn-sm" id="filterEligible">🟢 Eligible (Ready)</button>
+                        <button class="btn btn-primary btn-sm" id="filterVoted">🟡 Already Voted</button>
+                    </div>
+                    <button class="btn btn-accent btn-sm" id="btnSyncAll">
+                        🔄 Sync Live Status
+                    </button>
+                </div>
+
+                <div class="table-container" style="margin-bottom: 24px;">
+                    <table id="eligibilityTable">
+                        <thead>
+                            <tr>
+                                <th>Member / Label</th>
+                                <th>Phone Number</th>
+                                <th>Voting Status</th>
+                                <th>Next Eligible At</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr><td colspan="4" class="text-center">Loading eligibility status...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h2>⚡ Account Control & Test Reset</h2>
+                <div class="form-group">
+                    <label for="selectAccount">Select Active Account</label>
+                    <select id="selectAccount">
+                        <option value="">-- Choose a registered phone number --</option>
+                    </select>
+                </div>
+
+                <!-- Cooldown Status Display -->
+                <div id="cooldownCard" class="cooldown-box hidden">
+                    <div class="cooldown-header">
+                        <span id="cooldownBadge" class="status-badge badge-green">Eligible</span>
+                        <span id="cooldownTimerText" class="cooldown-timer">00:00:00</span>
+                    </div>
+                    <p id="cooldownExplanation">Ready to scrape immediately.</p>
+                </div>
+
+                <div class="action-bar">
+                    <button id="btnStartScrape" class="btn btn-gold btn-large" disabled>
+                        Claim Free Vote (+5) [12-Hr Enforced]
+                    </button>
+                    <button id="btnResetCooldown" class="btn btn-primary" style="margin-top: 8px; width: 100%;">
+                        ↻ Reset Cooldown for Testing
+                    </button>
+                </div>
+
+                <div id="scrapeProgress" class="alert hidden">
+                    <span class="spinner"></span> Executing authenticated scrape for <strong>Yezemene Award (Free Data)</strong>...
+                </div>
+
+                <h3>Live Scraping History</h3>
+                <div class="table-container">
+                    <table id="historyTable">
+                        <thead>
+                            <tr>
+                                <th>Job #</th>
+                                <th>Started (UTC)</th>
+                                <th>Status</th>
+                                <th>Records</th>
+                                <th>Error / Info</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr><td colspan="5" class="text-center">Select an account to view logs</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <script src="/app.js?v=2"></script>
+</body>
+</html>
