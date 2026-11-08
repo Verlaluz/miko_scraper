@@ -1,0 +1,30 @@
+services:
+  miko_scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: miko_scraper
+    restart: unless-stopped
+
+    # Map container port 3000 to host port 3000.
+    # Change the left side (host) if something else is using port 3000.
+    ports:
+      - "3000:3000"
+
+    # Load secrets from your local .env file — it is never baked into the image.
+    # This covers APP_SECRET_KEY, TELOXIDE_TOKEN, RUST_LOG, etc.
+    env_file:
+      - .env
+
+    # Override two specific variables so the container works correctly:
+    #   SERVER_HOST must be 0.0.0.0 (not 127.0.0.1) so Docker can reach the port.
+    #   DATABASE_URL points to the mounted volume path inside the container.
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - DATABASE_URL=sqlite:/app/data/miko_scraper.db
+
+    # Mount the ./data directory on the host to /app/data inside the container.
+    # Your miko_scraper.db file must be placed inside ./data/ before first run.
+    # The DB file is never committed to git — this preserves all 55+ accounts.
+    volumes:
+      - ./data:/app/data

@@ -7,3 +7,6 @@ creativeawards_home.html
 nominee_alpha.json
 results.json
 index.js
+
+# Docker: live database mount directory (never commit the DB)
+data/
