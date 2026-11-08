@@ -3,7 +3,7 @@
 # Compiles the Rust binary inside a Linux container so the output is a proper
 # Linux ELF executable — no cross-compilation hassle on Windows.
 # =============================================================================
-FROM rust:1.82-slim AS builder
+FROM rust:1-slim AS builder
 
 WORKDIR /app
 
