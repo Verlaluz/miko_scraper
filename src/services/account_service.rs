@@ -17,8 +17,14 @@ pub struct WorkerStatistics {
     pub telegram_id: i64,
     pub display_name: String,
     pub account_count: i64,
-    pub eligible_count: i64,
     pub cooldown_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingOtpAccount {
+    pub phone_number: String,
+    pub worker_name: Option<String>,
+    pub worker_telegram_id: Option<i64>,
 }
 
 impl AccountService {
@@ -169,18 +175,10 @@ impl AccountService {
     }
 
     pub async fn worker_statistics(&self) -> Result<Vec<WorkerStatistics>, AppError> {
-        Ok(sqlx::query_as::<_, (i64, String, i64, i64, i64)>(
+        Ok(sqlx::query_as::<_, (i64, String, i64, i64)>(
             "SELECT w.telegram_id,
                     w.display_name,
                     COUNT(DISTINCT a.id) AS account_count,
-                    SUM(CASE
-                        WHEN a.registration_status = 'VERIFIED'
-                         AND (
-                            latest.completed_at IS NULL
-                            OR datetime(latest.completed_at, '+12 hours') <= datetime('now')
-                         )
-                        THEN 1 ELSE 0
-                    END) AS eligible_count,
                     SUM(CASE
                         WHEN a.registration_status = 'VERIFIED'
                          AND latest.completed_at IS NOT NULL
@@ -201,14 +199,32 @@ impl AccountService {
         .fetch_all(&self.pool)
         .await?
         .into_iter()
-        .map(|(telegram_id, display_name, account_count, eligible_count, cooldown_count)| {
+        .map(|(telegram_id, display_name, account_count, cooldown_count)| {
             WorkerStatistics {
                 telegram_id,
                 display_name,
                 account_count,
-                eligible_count,
                 cooldown_count,
             }
+        })
+        .collect())
+    }
+
+    pub async fn pending_otp_accounts(&self) -> Result<Vec<PendingOtpAccount>, AppError> {
+        Ok(sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(
+            "SELECT a.phone_number, w.display_name, w.telegram_id
+             FROM phone_accounts a
+             LEFT JOIN telegram_workers w ON w.telegram_id = a.added_by_telegram_id
+             WHERE a.registration_status = 'PENDING_OTP'
+             ORDER BY a.created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(phone_number, worker_name, worker_telegram_id)| PendingOtpAccount {
+            phone_number,
+            worker_name,
+            worker_telegram_id,
         })
         .collect())
     }

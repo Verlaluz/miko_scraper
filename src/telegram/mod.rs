@@ -207,11 +207,10 @@ async fn handle_command(
                         .enumerate()
                         .map(|(index, worker)| {
                             format!(
-                                "{}. <b>{}</b> — {} account(s), {} eligible, {} cooldown (<code>{}</code>)",
+                                "{}. <b>{}</b> — {} account(s), {} cooldown (<code>{}</code>)",
                                 index + 1,
                                 worker.display_name,
                                 worker.account_count,
-                                worker.eligible_count,
                                 worker.cooldown_count,
                                 worker.telegram_id
                             )
@@ -222,6 +221,12 @@ async fn handle_command(
                 };
                 bot.send_message(msg.chat.id, report)
                     .parse_mode(teloxide::types::ParseMode::Html)
+                    .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                        InlineKeyboardButton::callback(
+                            "📩 Pending OTP accounts",
+                            "admin:pending_otp",
+                        ),
+                    ]]))
                     .await?;
             }
         }
@@ -476,6 +481,43 @@ async fn handle_status_filter(
     scraping_service: Arc<ScrapingService>,
     admin_telegram_ids: Vec<i64>,
 ) -> HandlerResult {
+    if data_is_admin_pending_otp(&query, &admin_telegram_ids) {
+        bot.answer_callback_query(query.id).await?;
+        let pending = account_service.pending_otp_accounts().await?;
+        let report = if pending.is_empty() {
+            "✅ No accounts are currently pending OTP verification.".to_string()
+        } else {
+            let rows = pending
+                .iter()
+                .enumerate()
+                .map(|(index, account)| {
+                    let worker = account
+                        .worker_name
+                        .as_deref()
+                        .unwrap_or("Unassigned worker");
+                    let worker_id = account
+                        .worker_telegram_id
+                        .map(|id| format!(" ({})", id))
+                        .unwrap_or_default();
+                    format!(
+                        "{}. <code>{}</code> — {}{}",
+                        index + 1,
+                        account.phone_number,
+                        worker,
+                        worker_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("📩 <b>Pending OTP accounts: {}</b>\n\n{}", pending.len(), rows)
+        };
+        if let Some(message) = query.message {
+            bot.send_message(message.chat().id, report)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .await?;
+        }
+        return Ok(());
+    }
     if !admin_telegram_ids.contains(&(query.from.id.0 as i64)) {
         bot.answer_callback_query(query.id)
             .text("Status controls are available to administrators only.")
@@ -483,6 +525,7 @@ async fn handle_status_filter(
             .await?;
         return Ok(());
     }
+
     let data = query.data.clone().unwrap_or_else(|| "status:all:0".to_string());
     if let Some(value) = data.strip_prefix("cooldown:") {
         let maximum_minutes = value.parse::<i64>().ok().unwrap_or(30);
@@ -565,6 +608,11 @@ async fn handle_status_filter(
         range,
     )
     .await
+}
+
+fn data_is_admin_pending_otp(query: &CallbackQuery, admin_telegram_ids: &[i64]) -> bool {
+    query.data.as_deref() == Some("admin:pending_otp")
+        && admin_telegram_ids.contains(&(query.from.id.0 as i64))
 }
 
 async fn handle_cooldown_filter(
