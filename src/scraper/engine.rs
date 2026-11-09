@@ -134,9 +134,8 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
 
             let lower = body_text.to_lowercase();
             // CreativeAwards sends 409 Conflict when already voted today!
-            if status.as_u16() == 409 
-                || status.as_u16() == 422 
-                || lower.contains("already cast") 
+            if status.as_u16() == 409
+                || lower.contains("already cast")
                 || lower.contains("already claimed") 
                 || lower.contains("already voted") 
             {
