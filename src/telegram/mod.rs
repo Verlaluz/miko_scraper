@@ -207,12 +207,12 @@ async fn handle_command(
                         .enumerate()
                         .map(|(index, worker)| {
                             format!(
-                                "{}. <b>{}</b> — {} account(s), {} eligible, {} claimed vote(s) (<code>{}</code>)",
+                                "{}. <b>{}</b> — {} account(s), {} eligible, {} cooldown (<code>{}</code>)",
                                 index + 1,
                                 worker.display_name,
                                 worker.account_count,
                                 worker.eligible_count,
-                                worker.claimed_votes,
+                                worker.cooldown_count,
                                 worker.telegram_id
                             )
                         })

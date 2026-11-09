@@ -18,7 +18,7 @@ pub struct WorkerStatistics {
     pub display_name: String,
     pub account_count: i64,
     pub eligible_count: i64,
-    pub claimed_votes: i64,
+    pub cooldown_count: i64,
 }
 
 impl AccountService {
@@ -181,7 +181,12 @@ impl AccountService {
                          )
                         THEN 1 ELSE 0
                     END) AS eligible_count,
-                    COALESCE(SUM(history.claimed_votes), 0) AS claimed_votes
+                    SUM(CASE
+                        WHEN a.registration_status = 'VERIFIED'
+                         AND latest.completed_at IS NOT NULL
+                         AND datetime(latest.completed_at, '+12 hours') > datetime('now')
+                        THEN 1 ELSE 0
+                    END) AS cooldown_count
              FROM telegram_workers w
              LEFT JOIN phone_accounts a ON a.added_by_telegram_id = w.telegram_id
              LEFT JOIN (
@@ -190,25 +195,19 @@ impl AccountService {
                 WHERE scraping_status = 'SUCCESS'
                 GROUP BY phone_account_id
              ) latest ON latest.phone_account_id = a.id
-             LEFT JOIN (
-                SELECT phone_account_id, SUM(records_scraped) AS claimed_votes
-                FROM scraping_history
-                WHERE scraping_status = 'SUCCESS'
-                GROUP BY phone_account_id
-             ) history ON history.phone_account_id = a.id
              GROUP BY w.telegram_id, w.display_name
              ORDER BY account_count DESC, w.display_name ASC",
         )
         .fetch_all(&self.pool)
         .await?
         .into_iter()
-        .map(|(telegram_id, display_name, account_count, eligible_count, claimed_votes)| {
+        .map(|(telegram_id, display_name, account_count, eligible_count, cooldown_count)| {
             WorkerStatistics {
                 telegram_id,
                 display_name,
                 account_count,
                 eligible_count,
-                claimed_votes,
+                cooldown_count,
             }
         })
         .collect())
