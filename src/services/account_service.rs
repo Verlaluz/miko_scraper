@@ -131,6 +131,46 @@ impl AccountService {
         Ok(challenge_id)
     }
 
+    pub async fn attribute_account(
+        &self,
+        raw_phone: &str,
+        telegram_id: i64,
+    ) -> Result<(), AppError> {
+        let phone = self.normalize_phone_number(raw_phone)?;
+        sqlx::query("UPDATE phone_accounts SET added_by_telegram_id = ? WHERE phone_number = ?")
+            .bind(telegram_id)
+            .bind(phone)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn register_worker(&self, telegram_id: i64, display_name: &str) -> Result<(), AppError> {
+        sqlx::query(
+            "INSERT INTO telegram_workers (telegram_id, display_name, registered_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(telegram_id) DO UPDATE SET display_name = excluded.display_name",
+        )
+        .bind(telegram_id)
+        .bind(display_name)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn worker_account_counts(&self) -> Result<Vec<(i64, String, i64)>, AppError> {
+        Ok(sqlx::query_as(
+            "SELECT w.telegram_id, w.display_name, COUNT(a.id)
+             FROM telegram_workers w
+             LEFT JOIN phone_accounts a ON a.added_by_telegram_id = w.telegram_id
+             GROUP BY w.telegram_id, w.display_name
+             ORDER BY COUNT(a.id) DESC, w.display_name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Step 2 of registration: Submits OTP to target site for verification.
     /// If valid, encrypts session at rest and updates account status to `VERIFIED`.
     pub async fn verify_and_save_session(

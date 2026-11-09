@@ -8,6 +8,7 @@ pub struct Config {
     pub database_url: String,
     pub app_secret_key: [u8; 32],
     pub telegram_bot_token: Option<String>,
+    pub admin_telegram_ids: Vec<i64>,
 }
 
 impl Config {
@@ -41,6 +42,11 @@ impl Config {
         app_secret_key.copy_from_slice(&secret_bytes);
 
         let telegram_bot_token = env::var("TELOXIDE_TOKEN").ok();
+        let admin_telegram_ids = env::var("ADMIN_TELEGRAM_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.trim().parse::<i64>().ok())
+            .collect();
 
         Ok(Self {
             server_host,
@@ -48,6 +54,7 @@ impl Config {
             database_url,
             app_secret_key,
             telegram_bot_token,
+            admin_telegram_ids,
         })
     }
 }

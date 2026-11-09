@@ -58,6 +58,16 @@ Open http://localhost:3000 — you should see the dashboard.
 
 You **do not** need to edit your `.env` file for Docker. The overrides happen in `docker-compose.yml`.
 
+To enable worker tracking, add the comma-separated Telegram user IDs of administrators:
+
+```env
+ADMIN_TELEGRAM_IDS=123456789,987654321
+```
+
+An administrator can register a worker with `/adminregister <telegram_id> <name>`.
+Phone accounts started by that worker are attributed to their Telegram ID, and
+`/admin` shows each registered worker's account total.
+
 ---
 
 ## Common Commands

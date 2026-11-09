@@ -32,6 +32,10 @@ pub enum Command {
     Start,
     #[command(description = "Register a new phone number with OTP.")]
     Register,
+    #[command(description = "Register a worker: /adminregister <telegram_id> <name>.")]
+    Adminregister(String),
+    #[command(description = "Show worker account counts.")]
+    Admin,
     #[command(description = "View real-time voting eligibility for all accounts.")]
     Status,
     #[command(description = "Show accounts eligible to vote now.")]
@@ -51,6 +55,7 @@ pub fn start_telegram_bot(
     token: String,
     account_service: Arc<AccountService>,
     scraping_service: Arc<ScrapingService>,
+    admin_telegram_ids: Vec<i64>,
 ) {
     tokio::spawn(async move {
         let storage = InMemStorage::<State>::new();
@@ -83,7 +88,8 @@ pub fn start_telegram_bot(
                 .dependencies(dptree::deps![
                     storage.clone(),
                     Arc::clone(&account_service),
-                    Arc::clone(&scraping_service)
+                    Arc::clone(&scraping_service),
+                    admin_telegram_ids.clone()
                 ])
                 .enable_ctrlc_handler()
                 .build();
@@ -105,6 +111,7 @@ async fn handle_command(
     msg: Message,
     scraping_service: Arc<ScrapingService>,
     account_service: Arc<AccountService>,
+    admin_telegram_ids: Vec<i64>,
 ) -> HandlerResult {
     match cmd {
         Command::Start | Command::Help => {
@@ -113,6 +120,7 @@ async fn handle_command(
                 Use this bot to register phone accounts, verify OTPs, and track 12-hour votes for family & friends.\n\n\
                 <b>Commands:</b>\n\
                 /register — Add a phone number & receive OTP\n\
+                /admin — Show worker account counts (admins only)\n\
                 /status — View totals and choose an account\n\
                 /eligible — Show accounts ready to vote\n\
                 /cooldown — Show accounts in cooldown\n\
@@ -134,6 +142,59 @@ async fn handle_command(
             .parse_mode(teloxide::types::ParseMode::Html)
             .await?;
         }
+        Command::Adminregister(args) => {
+            if !is_admin(&msg, &admin_telegram_ids) {
+                bot.send_message(msg.chat.id, "⛔ You are not authorized to register workers.")
+                    .await?;
+            } else {
+                let mut parts = args.splitn(2, char::is_whitespace);
+                let telegram_id = parts.next().and_then(|value| value.parse::<i64>().ok());
+                let name = parts.next().map(str::trim).filter(|value| !value.is_empty());
+                match (telegram_id, name) {
+                    (Some(telegram_id), Some(name)) => {
+                        account_service.register_worker(telegram_id, name).await?;
+                        bot.send_message(
+                            msg.chat.id,
+                            format!("✅ Worker <b>{}</b> ({}) is now registered.", name, telegram_id),
+                        )
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .await?;
+                    }
+                    _ => {
+                        bot.send_message(
+                            msg.chat.id,
+                            "Usage: <code>/adminregister 123456789 Worker Name</code>",
+                        )
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .await?;
+                    }
+                }
+            }
+        }
+        Command::Admin => {
+            if !is_admin(&msg, &admin_telegram_ids) {
+                bot.send_message(msg.chat.id, "⛔ You are not authorized to view worker statistics.")
+                    .await?;
+            } else {
+                let workers = account_service.worker_account_counts().await?;
+                let report = if workers.is_empty() {
+                    "No workers are registered yet.".to_string()
+                } else {
+                    let rows = workers
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (telegram_id, name, count))| {
+                            format!("{}. <b>{}</b> — {} account(s) (<code>{}</code>)", index + 1, name, count, telegram_id)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("📊 <b>Worker account totals</b>\n\n{}", rows)
+                };
+                bot.send_message(msg.chat.id, report)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await?;
+            }
+        }
         Command::Status | Command::Eligible | Command::Cooldown => {
             let accounts = account_service.list_accounts().await?;
             if accounts.is_empty() {
@@ -144,6 +205,7 @@ async fn handle_command(
                 .await?;
                 return Ok(());
             }
+
             let statuses = scraping_service.get_all_accounts_vote_status(&accounts).await?;
             let filtered_statuses: Vec<AccountVoteStatus> = match &cmd {
                 Command::Eligible => statuses
@@ -195,6 +257,13 @@ async fn handle_command(
         }
     }
     Ok(())
+}
+
+fn is_admin(msg: &Message, admin_telegram_ids: &[i64]) -> bool {
+    msg.from
+        .as_ref()
+        .map(|user| admin_telegram_ids.contains(&(user.id.0 as i64)))
+        .unwrap_or(false)
 }
 
 async fn send_status_report(
@@ -644,6 +713,11 @@ async fn handle_phone_number(
 
     match account_service.initiate_registration(raw_text).await {
         Ok(_challenge_id) => {
+            if let Some(user) = msg.from.as_ref() {
+                account_service
+                    .attribute_account(raw_text, user.id.0 as i64)
+                    .await?;
+            }
             let normalized = account_service.normalize_phone_number(raw_text)?;
             dialogue
                 .update(State::AwaitingOtp {

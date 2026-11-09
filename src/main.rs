@@ -80,6 +80,7 @@ async fn main() -> Result<(), AppError> {
             token,
             Arc::clone(&account_service),
             Arc::clone(&scraping_service),
+            config.admin_telegram_ids,
         );
     } else {
         tracing::warn!("TELOXIDE_TOKEN not set. Running Web Dashboard only.");
