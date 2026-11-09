@@ -18,6 +18,7 @@ pub enum State {
     #[default]
     Start,
     AwaitingPhoneNumber,
+    AwaitingWorkerName,
     AwaitingAccountSearch,
     AwaitingOtp {
         phone_number: String,
@@ -32,6 +33,8 @@ pub enum Command {
     Start,
     #[command(description = "Register a new phone number with OTP.")]
     Register,
+    #[command(description = "Become a worker and track your registered accounts.")]
+    Worker,
     #[command(description = "Register a worker: /adminregister <telegram_id> <name>.")]
     Adminregister(String),
     #[command(description = "Show worker account counts.")]
@@ -77,6 +80,7 @@ pub fn start_telegram_bot(
                         )
                         .branch(dptree::case![State::Start].endpoint(handle_start_text))
                         .branch(dptree::case![State::AwaitingPhoneNumber].endpoint(handle_phone_number))
+                        .branch(dptree::case![State::AwaitingWorkerName].endpoint(handle_worker_name))
                         .branch(dptree::case![State::AwaitingAccountSearch].endpoint(handle_account_search))
                         .branch(
                             dptree::case![State::AwaitingOtp { phone_number }]
@@ -120,6 +124,7 @@ async fn handle_command(
                 Use this bot to register phone accounts, verify OTPs, and track 12-hour votes for family & friends.\n\n\
                 <b>Commands:</b>\n\
                 /register — Add a phone number & receive OTP\n\
+                /worker — Become a worker and track your accounts\n\
                 /admin — Show worker account counts (admins only)\n\
                 /status — View totals and choose an account\n\
                 /eligible — Show accounts ready to vote\n\
@@ -140,6 +145,14 @@ async fn handle_command(
                 Send /cancel at any time to exit.",
             )
             .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+        }
+        Command::Worker => {
+            dialogue.update(State::AwaitingWorkerName).await?;
+            bot.send_message(
+                msg.chat.id,
+                "👷 Please enter your name. This name will appear in the administrators' worker report.",
+            )
             .await?;
         }
         Command::Adminregister(args) => {
@@ -264,6 +277,40 @@ fn is_admin(msg: &Message, admin_telegram_ids: &[i64]) -> bool {
         .as_ref()
         .map(|user| admin_telegram_ids.contains(&(user.id.0 as i64)))
         .unwrap_or(false)
+}
+
+async fn handle_worker_name(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+    account_service: Arc<AccountService>,
+) -> HandlerResult {
+    let Some(name) = msg.text().map(str::trim).filter(|name| !name.is_empty()) else {
+        bot.send_message(msg.chat.id, "Please enter a valid name, or use /cancel.")
+            .await?;
+        return Ok(());
+    };
+
+    let Some(user) = msg.from.as_ref() else {
+        bot.send_message(msg.chat.id, "I could not identify your Telegram account. Please try again.")
+            .await?;
+        return Ok(());
+    };
+
+    account_service
+        .register_worker(user.id.0 as i64, name)
+        .await?;
+    dialogue.update(State::Start).await?;
+    bot.send_message(
+        msg.chat.id,
+        format!(
+            "🎉 Congratulations, {}! You are now registered as a worker.\n\nYour Telegram ID: <code>{}</code>\nUse /register to add phone accounts. The administrators will see your account total in /admin.",
+            name, user.id.0
+        ),
+    )
+    .parse_mode(teloxide::types::ParseMode::Html)
+    .await?;
+    Ok(())
 }
 
 async fn send_status_report(
