@@ -144,7 +144,6 @@ async fn handle_command(
                 .await?;
                 return Ok(());
             }
-
             let statuses = scraping_service.get_all_accounts_vote_status(&accounts).await?;
             let filtered_statuses: Vec<AccountVoteStatus> = match &cmd {
                 Command::Eligible => statuses
@@ -226,7 +225,7 @@ async fn send_status_report(
     let visible_statuses = match range {
         Some(10) => &statuses[..statuses.len().min(10)],
         Some(20) => &statuses[..statuses.len().min(20)],
-        Some(100) => &statuses[statuses.len().min(20)..statuses.len().min(120)],
+        Some(100) => &statuses[..statuses.len().min(100)],
         _ => statuses,
     };
     let page_count = ((visible_statuses.len() + page_size - 1) / page_size).max(1);
@@ -289,7 +288,7 @@ fn status_keyboard(
                 row.iter()
                     .map(|status| {
                         InlineKeyboardButton::callback(
-                            format!("Account #{}", status.account_id),
+                            status.phone_number.clone(),
                             format!("account:{}", status.account_id),
                         )
                     })
@@ -321,6 +320,10 @@ fn status_keyboard(
             InlineKeyboardButton::callback("Recent 20", "range:20"),
             InlineKeyboardButton::callback("Past 100", "range:100"),
         ]);
+        rows.push(vec![
+            InlineKeyboardButton::callback("⏱️ ≤30 minutes", "cooldown:30"),
+            InlineKeyboardButton::callback("⏱️ 30–60 minutes", "cooldown:60"),
+        ]);
         rows.push(vec![InlineKeyboardButton::callback(
             "🔎 Search account",
             "search:account",
@@ -340,6 +343,17 @@ async fn handle_status_filter(
     scraping_service: Arc<ScrapingService>,
 ) -> HandlerResult {
     let data = query.data.clone().unwrap_or_else(|| "status:all:0".to_string());
+    if let Some(value) = data.strip_prefix("cooldown:") {
+        let maximum_minutes = value.parse::<i64>().ok().unwrap_or(30);
+        return handle_cooldown_filter(
+            bot,
+            query,
+            account_service,
+            scraping_service,
+            maximum_minutes,
+        )
+        .await;
+    }
     if data == "search:account" {
         bot.answer_callback_query(query.id).await?;
         dialogue.update(State::AwaitingAccountSearch).await?;
@@ -408,6 +422,44 @@ async fn handle_status_filter(
         filter,
         page,
         range,
+    )
+    .await
+}
+
+async fn handle_cooldown_filter(
+    bot: Bot,
+    query: CallbackQuery,
+    account_service: Arc<AccountService>,
+    scraping_service: Arc<ScrapingService>,
+    maximum_minutes: i64,
+) -> HandlerResult {
+    bot.answer_callback_query(query.id).await?;
+    let Some(message) = query.message else {
+        return Ok(());
+    };
+    let accounts = account_service.list_accounts().await?;
+    let statuses = scraping_service.get_all_accounts_vote_status(&accounts).await?;
+    let minimum_seconds = if maximum_minutes == 60 { 30 * 60 } else { 0 };
+    let maximum_seconds = maximum_minutes * 60;
+    let filtered: Vec<AccountVoteStatus> = statuses
+        .iter()
+        .filter(|status| {
+            !status.is_eligible
+                && status.remaining_seconds > minimum_seconds
+                && status.remaining_seconds <= maximum_seconds
+        })
+        .cloned()
+        .collect();
+
+    send_status_report(
+        &bot,
+        message.chat().id,
+        &filtered,
+        Some(statuses.len()),
+        false,
+        "all",
+        0,
+        Some(100),
     )
     .await
 }
