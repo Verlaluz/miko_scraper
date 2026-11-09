@@ -2,10 +2,12 @@ use crate::models::RegistrationStatus;
 use crate::services::{AccountService, ScrapingService};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 /// Starts an autonomous background worker loop that runs 24/7.
 ///
-/// Every 60 seconds, it inspects all verified accounts in the database.
+/// Every `check_interval`, it inspects all verified accounts in the database.
 /// Whenever an account reaches its 12-hour cooldown expiration, the worker
 /// automatically claims the +5 free votes without requiring any manual button click.
 pub fn start_autonomous_scheduler(
@@ -20,8 +22,8 @@ pub fn start_autonomous_scheduler(
         );
 
         let mut interval = tokio::time::interval(check_interval);
-        // First tick completes immediately
-        interval.tick().await;
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let concurrency_limit = Arc::new(Semaphore::new(8));
 
         loop {
             interval.tick().await;
@@ -36,6 +38,7 @@ pub fn start_autonomous_scheduler(
                 }
             };
 
+            let mut eligible_accounts = Vec::new();
             for account in accounts {
                 if account.registration_status != RegistrationStatus::Verified {
                     continue;
@@ -49,21 +52,7 @@ pub fn start_autonomous_scheduler(
                                 "Autonomous worker: Account #{} ({}) is eligible! Claiming free votes automatically...",
                                 account.id, account.phone_number
                             );
-
-                            match scraping_service.start_scraping(account.id).await {
-                                Ok(rec) => {
-                                    tracing::info!(
-                                        "Autonomous worker: Successfully claimed votes for #{}! Records: {}, Status: {:?}",
-                                        account.id, rec.records_scraped, rec.scraping_status
-                                    );
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        "Autonomous worker: Failed or skipped claim for #{}: {}",
-                                        account.id, err
-                                    );
-                                }
-                            }
+                            eligible_accounts.push(account);
                         } else {
                             tracing::debug!(
                                 "Account #{} ({}) on cooldown. {}s remaining.",
@@ -77,6 +66,60 @@ pub fn start_autonomous_scheduler(
                             account.id, e
                         );
                     }
+                }
+            }
+
+            if eligible_accounts.is_empty() {
+                continue;
+            }
+
+            tracing::info!(
+                "Autonomous worker: {} eligible account(s) queued for concurrent claims.",
+                eligible_accounts.len()
+            );
+
+            let mut tasks = JoinSet::new();
+            for account in eligible_accounts {
+                let scraping_service = Arc::clone(&scraping_service);
+                let concurrency_limit = Arc::clone(&concurrency_limit);
+                tasks.spawn(async move {
+                    let permit = match concurrency_limit.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            tracing::error!(
+                                "Autonomous worker: concurrency limiter closed before account #{} could run.",
+                                account.id
+                            );
+                            return;
+                        }
+                    };
+
+                    let result = scraping_service.start_scraping(account.id).await;
+                    drop(permit);
+
+                    match result {
+                        Ok(rec) => {
+                            tracing::info!(
+                                "Autonomous worker: Successfully claimed votes for #{}! Records: {}, Status: {:?}",
+                                account.id,
+                                rec.records_scraped,
+                                rec.scraping_status
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "Autonomous worker: Failed or skipped claim for #{}: {}",
+                                account.id,
+                                err
+                            );
+                        }
+                    }
+                });
+            }
+
+            while let Some(result) = tasks.join_next().await {
+                if let Err(err) = result {
+                    tracing::error!("Autonomous worker claim task failed: {}", err);
                 }
             }
         }
