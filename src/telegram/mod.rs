@@ -126,7 +126,6 @@ async fn handle_command(
                 /register — Add a phone number & receive OTP\n\
                 /worker — Become a worker and track your accounts\n\
                 /admin — Show worker account counts (admins only)\n\
-                /status — View totals and choose an account\n\
                 /eligible — Show accounts ready to vote\n\
                 /cooldown — Show accounts in cooldown\n\
                 /health — Check bot and database health\n\
@@ -134,6 +133,10 @@ async fn handle_command(
                 /help — Show this help message";
             bot.send_message(msg.chat.id, welcome)
                 .parse_mode(teloxide::types::ParseMode::Html)
+                .await?;
+        }
+        Command::Status if !is_admin(&msg, &admin_telegram_ids) => {
+            bot.send_message(msg.chat.id, "⛔ The /status command is available to administrators only.")
                 .await?;
         }
         Command::Register => {
@@ -457,7 +460,15 @@ async fn handle_status_filter(
     query: CallbackQuery,
     account_service: Arc<AccountService>,
     scraping_service: Arc<ScrapingService>,
+    admin_telegram_ids: Vec<i64>,
 ) -> HandlerResult {
+    if !admin_telegram_ids.contains(&(query.from.id.0 as i64)) {
+        bot.answer_callback_query(query.id)
+            .text("Status controls are available to administrators only.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
     let data = query.data.clone().unwrap_or_else(|| "status:all:0".to_string());
     if let Some(value) = data.strip_prefix("cooldown:") {
         let maximum_minutes = value.parse::<i64>().ok().unwrap_or(30);
@@ -733,7 +744,7 @@ async fn handle_start_text(
 
     bot.send_message(
         msg.chat.id,
-        "💡 <b>Tip:</b> Paste any Ethiopian phone number (e.g. <code>0912345678</code> or <code>+251912345678</code>) directly to register it!\n\nOr use /status to view voting eligibility timers.",
+        "💡 <b>Tip:</b> Paste any Ethiopian phone number (e.g. <code>0912345678</code> or <code>+251912345678</code>) directly to register it!",
     )
     .parse_mode(teloxide::types::ParseMode::Html)
     .await?;
@@ -788,7 +799,7 @@ async fn handle_phone_number(
             dialogue.update(State::Start).await?;
             bot.send_message(
                 msg.chat.id,
-                format!("ℹ️ <b>Already Registered!</b>\n\n{}\n\nUse /status to see its current voting countdown.", msg_str),
+                format!("ℹ️ <b>Already Registered!</b>\n\n{}", msg_str),
             )
             .parse_mode(teloxide::types::ParseMode::Html)
             .await?;
