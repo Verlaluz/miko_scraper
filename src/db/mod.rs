@@ -1,3 +1,4 @@
+pub mod backups;
 pub mod migrations;
 
 use crate::errors::AppError;

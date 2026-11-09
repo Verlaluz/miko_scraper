@@ -1,5 +1,6 @@
 use crate::models::RegistrationStatus;
 use crate::services::{AccountService, ScrapingService};
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -121,6 +122,21 @@ pub fn start_autonomous_scheduler(
                 if let Err(err) = result {
                     tracing::error!("Autonomous worker claim task failed: {}", err);
                 }
+            }
+        }
+    });
+}
+
+pub fn start_daily_database_backup(pool: SqlitePool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+            match crate::db::backups::create_daily_backup(&pool).await {
+                Ok(path) => tracing::info!("Daily SQLite backup created at {:?}", path),
+                Err(error) => tracing::error!("Daily SQLite backup failed: {}", error),
             }
         }
     });

@@ -71,6 +71,7 @@ async fn main() -> Result<(), AppError> {
         Arc::clone(&scraping_service),
         std::time::Duration::from_secs(30),
     );
+    scheduler::start_daily_database_backup(pool.clone());
 
     // 8. Start Telegram Bot if token is configured
     if let Some(token) = config.telegram_bot_token {

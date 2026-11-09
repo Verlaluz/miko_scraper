@@ -103,6 +103,10 @@ are never stored in GitHub Actions.
 - The `data/` directory is also gitignored
 - The database file lives on your host machine at `./data/miko_scraper.db`
 - Docker just mounts it — if you delete the container, your data is safe
+- The application creates a SQLite snapshot in `./data/backups/` at startup and
+  every 24 hours, retaining the seven most recent backups.
+- Backups are created with SQLite's online `VACUUM INTO` operation, so the bot
+  stays running while the snapshot is written.
 
 ---
 
