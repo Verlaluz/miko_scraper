@@ -484,8 +484,8 @@ async fn handle_status_filter(
     if data_is_admin_pending_otp(&query, &admin_telegram_ids) {
         bot.answer_callback_query(query.id).await?;
         let pending = account_service.pending_otp_accounts().await?;
-        let report = if pending.is_empty() {
-            "✅ No accounts are currently pending OTP verification.".to_string()
+        let report_lines = if pending.is_empty() {
+            vec!["✅ No accounts are currently pending OTP verification.".to_string()]
         } else {
             let rows = pending
                 .iter()
@@ -507,14 +507,30 @@ async fn handle_status_filter(
                         worker_id
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("📩 <b>Pending OTP accounts: {}</b>\n\n{}", pending.len(), rows)
+                .collect::<Vec<_>>();
+            let mut lines = vec![format!("📩 <b>Pending OTP accounts: {}</b>", pending.len())];
+            lines.extend(rows);
+            lines
         };
         if let Some(message) = query.message {
-            bot.send_message(message.chat().id, report)
-                .parse_mode(teloxide::types::ParseMode::Html)
-                .await?;
+            let mut chunk = String::new();
+            for line in report_lines {
+                if chunk.len() + line.len() + 1 > 3800 {
+                    bot.send_message(message.chat().id, &chunk)
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .await?;
+                    chunk.clear();
+                }
+                if !chunk.is_empty() {
+                    chunk.push('\n');
+                }
+                chunk.push_str(&line);
+            }
+            if !chunk.is_empty() {
+                bot.send_message(message.chat().id, chunk)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await?;
+            }
         }
         return Ok(());
     }
