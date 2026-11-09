@@ -126,9 +126,6 @@ async fn handle_command(
                 /register — Add a phone number & receive OTP\n\
                 /worker — Become a worker and track your accounts\n\
                 /admin — Show worker account counts (admins only)\n\
-                /eligible — Show accounts ready to vote\n\
-                /cooldown — Show accounts in cooldown\n\
-                /health — Check bot and database health\n\
                 /cancel — Cancel current action\n\
                 /help — Show this help message";
             bot.send_message(msg.chat.id, welcome)
@@ -138,6 +135,15 @@ async fn handle_command(
         Command::Status if !is_admin(&msg, &admin_telegram_ids) => {
             bot.send_message(msg.chat.id, "⛔ The /status command is available to administrators only.")
                 .await?;
+        }
+        Command::Eligible | Command::Cooldown | Command::Health
+            if !is_admin(&msg, &admin_telegram_ids) =>
+        {
+            bot.send_message(
+                msg.chat.id,
+                "⛔ This command is available to administrators only.",
+            )
+            .await?;
         }
         Command::Register => {
             dialogue.update(State::AwaitingPhoneNumber).await?;
