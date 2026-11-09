@@ -18,6 +18,7 @@ pub enum State {
     #[default]
     Start,
     AwaitingPhoneNumber,
+    AwaitingAccountSearch,
     AwaitingOtp {
         phone_number: String,
     },
@@ -58,7 +59,9 @@ pub fn start_telegram_bot(
             let bot = Bot::new(token.clone());
 
             let handler = dptree::entry()
-                .branch(Update::filter_callback_query().endpoint(handle_status_filter))
+                .branch(                Update::filter_callback_query()
+                    .enter_dialogue::<CallbackQuery, InMemStorage<State>, State>()
+                    .endpoint(handle_status_filter))
                 .branch(
                     Update::filter_message()
                         .enter_dialogue::<Message, InMemStorage<State>, State>()
@@ -69,6 +72,7 @@ pub fn start_telegram_bot(
                         )
                         .branch(dptree::case![State::Start].endpoint(handle_start_text))
                         .branch(dptree::case![State::AwaitingPhoneNumber].endpoint(handle_phone_number))
+                        .branch(dptree::case![State::AwaitingAccountSearch].endpoint(handle_account_search))
                         .branch(
                             dptree::case![State::AwaitingOtp { phone_number }]
                                 .endpoint(handle_otp_code),
@@ -317,6 +321,10 @@ fn status_keyboard(
             InlineKeyboardButton::callback("Recent 20", "range:20"),
             InlineKeyboardButton::callback("Past 100", "range:100"),
         ]);
+        rows.push(vec![InlineKeyboardButton::callback(
+            "🔎 Search account",
+            "search:account",
+        )]);
     }
     if range.is_some() {
         rows.push(vec![InlineKeyboardButton::callback("⬅️ Back to ranges", "range:0")]);
@@ -326,11 +334,25 @@ fn status_keyboard(
 
 async fn handle_status_filter(
     bot: Bot,
+    dialogue: MyDialogue,
     query: CallbackQuery,
     account_service: Arc<AccountService>,
     scraping_service: Arc<ScrapingService>,
 ) -> HandlerResult {
     let data = query.data.clone().unwrap_or_else(|| "status:all:0".to_string());
+    if data == "search:account" {
+        bot.answer_callback_query(query.id).await?;
+        dialogue.update(State::AwaitingAccountSearch).await?;
+        if let Some(message) = query.message {
+            bot.send_message(
+                message.chat().id,
+                "🔎 Send the registered phone number to search.\nExample: <code>0946692896</code>",
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+        }
+        return Ok(());
+    }
     if let Some(value) = data.strip_prefix("range:") {
         return handle_status_range(
             bot,
@@ -416,6 +438,58 @@ async fn handle_status_range(
     .await
 }
 
+async fn handle_account_search(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+    account_service: Arc<AccountService>,
+    scraping_service: Arc<ScrapingService>,
+) -> HandlerResult {
+    let input = match msg.text() {
+        Some(value) => value.trim(),
+        None => {
+            bot.send_message(msg.chat.id, "Please send the phone number as text.")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let phone = match AccountService::normalize_phone(input) {
+        Ok(phone) => phone,
+        Err(_) => {
+            bot.send_message(
+                msg.chat.id,
+                "Invalid phone number. Use the format <code>0946692896</code>.",
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let accounts = account_service.list_accounts().await?;
+    let statuses = scraping_service.get_all_accounts_vote_status(&accounts).await?;
+    let status = statuses.iter().find(|status| status.phone_number == phone);
+    dialogue.update(State::Start).await?;
+
+    match status {
+        Some(status) => send_account_detail(&bot, msg.chat.id, status).await?,
+        None => {
+            bot.send_message(
+                msg.chat.id,
+                format!("No registered account was found for <code>{}</code>.", phone),
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback("⬅️ Back to ranges", "range:0"),
+            ]]))
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
 async fn handle_account_detail(
     bot: Bot,
     query: CallbackQuery,
@@ -434,6 +508,14 @@ async fn handle_account_detail(
             .await?;
         return Ok(());
     };
+    send_account_detail(&bot, message.chat().id, status).await
+}
+
+async fn send_account_detail(
+    bot: &Bot,
+    chat_id: ChatId,
+    status: &AccountVoteStatus,
+) -> HandlerResult {
     let status_text = if status.is_eligible {
         "🟢 Eligible (ready to vote)".to_string()
     } else {
@@ -445,7 +527,7 @@ async fn handle_account_detail(
     };
     let label = status.label.as_deref().unwrap_or("Unnamed");
     bot.send_message(
-        message.chat().id,
+        chat_id,
         format!(
             "👤 <b>Account #{}</b>\n\nLabel: {}\nPhone: <code>{}</code>\nStatus: {}\nLast vote: {}",
             status.account_id,

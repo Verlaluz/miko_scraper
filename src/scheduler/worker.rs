@@ -39,36 +39,57 @@ pub fn start_autonomous_scheduler(
                 }
             };
 
-            let mut eligible_accounts = Vec::new();
+            let eligibility_limit = Arc::new(Semaphore::new(32));
+            let mut eligibility_tasks = JoinSet::new();
+            let mut verified_count = 0;
             for account in accounts {
                 if account.registration_status != RegistrationStatus::Verified {
                     continue;
                 }
+                verified_count += 1;
 
-                // Check 12-hour cooldown status
-                match scraping_service.get_cooldown_status(account.id).await {
-                    Ok(cooldown) => {
-                        if cooldown.is_eligible {
-                            tracing::info!(
-                                "Autonomous worker: Account #{} ({}) is eligible! Claiming free votes automatically...",
-                                account.id, account.phone_number
-                            );
-                            eligible_accounts.push(account);
-                        } else {
-                            tracing::debug!(
-                                "Account #{} ({}) on cooldown. {}s remaining.",
-                                account.id, account.phone_number, cooldown.remaining_seconds
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Autonomous worker: Failed checking cooldown for account #{}: {}",
-                            account.id, e
+                let scraping_service = Arc::clone(&scraping_service);
+                let eligibility_limit = Arc::clone(&eligibility_limit);
+                eligibility_tasks.spawn(async move {
+                    let permit = eligibility_limit.acquire_owned().await.ok()?;
+                    let result = scraping_service
+                        .get_cooldown_status(account.id)
+                        .await
+                        .map(|cooldown| (account, cooldown));
+                    drop(permit);
+                    Some(result)
+                });
+            }
+
+            let mut eligible_accounts = Vec::new();
+            while let Some(result) = eligibility_tasks.join_next().await {
+                match result {
+                    Ok(Some(Ok((account, cooldown)))) if cooldown.is_eligible => {
+                        tracing::info!(
+                            "Autonomous worker: Account #{} ({}) is eligible! Claiming free votes automatically...",
+                            account.id,
+                            account.phone_number
                         );
+                        eligible_accounts.push(account);
+                    }
+                    Ok(Some(Ok((_account, _cooldown)))) => {}
+                    Ok(Some(Err(error))) => {
+                        tracing::error!("Autonomous worker: Failed checking cooldown: {}", error);
+                    }
+                    Ok(None) => {
+                        tracing::error!("Autonomous worker: Eligibility limiter closed unexpectedly.");
+                    }
+                    Err(error) => {
+                        tracing::error!("Autonomous worker eligibility task failed: {}", error);
                     }
                 }
             }
+
+            tracing::info!(
+                "Autonomous worker: scanned {} verified account(s); {} eligible account(s) queued.",
+                verified_count,
+                eligible_accounts.len()
+            );
 
             if eligible_accounts.is_empty() {
                 continue;
