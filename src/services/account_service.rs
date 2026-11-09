@@ -12,6 +12,15 @@ pub struct AccountService {
     otp_provider: Arc<dyn OtpProvider>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkerStatistics {
+    pub telegram_id: i64,
+    pub display_name: String,
+    pub account_count: i64,
+    pub eligible_count: i64,
+    pub claimed_votes: i64,
+}
+
 impl AccountService {
     pub fn new(
         pool: SqlitePool,
@@ -159,16 +168,50 @@ impl AccountService {
         Ok(())
     }
 
-    pub async fn worker_account_counts(&self) -> Result<Vec<(i64, String, i64)>, AppError> {
-        Ok(sqlx::query_as(
-            "SELECT w.telegram_id, w.display_name, COUNT(a.id)
+    pub async fn worker_statistics(&self) -> Result<Vec<WorkerStatistics>, AppError> {
+        Ok(sqlx::query_as::<_, (i64, String, i64, i64, i64)>(
+            "SELECT w.telegram_id,
+                    w.display_name,
+                    COUNT(DISTINCT a.id) AS account_count,
+                    SUM(CASE
+                        WHEN a.registration_status = 'VERIFIED'
+                         AND (
+                            latest.completed_at IS NULL
+                            OR datetime(latest.completed_at, '+12 hours') <= datetime('now')
+                         )
+                        THEN 1 ELSE 0
+                    END) AS eligible_count,
+                    COALESCE(SUM(history.claimed_votes), 0) AS claimed_votes
              FROM telegram_workers w
              LEFT JOIN phone_accounts a ON a.added_by_telegram_id = w.telegram_id
+             LEFT JOIN (
+                SELECT phone_account_id, MAX(scraping_completed_at) AS completed_at
+                FROM scraping_history
+                WHERE scraping_status = 'SUCCESS'
+                GROUP BY phone_account_id
+             ) latest ON latest.phone_account_id = a.id
+             LEFT JOIN (
+                SELECT phone_account_id, SUM(records_scraped) AS claimed_votes
+                FROM scraping_history
+                WHERE scraping_status = 'SUCCESS'
+                GROUP BY phone_account_id
+             ) history ON history.phone_account_id = a.id
              GROUP BY w.telegram_id, w.display_name
-             ORDER BY COUNT(a.id) DESC, w.display_name ASC",
+             ORDER BY account_count DESC, w.display_name ASC",
         )
         .fetch_all(&self.pool)
-        .await?)
+        .await?
+        .into_iter()
+        .map(|(telegram_id, display_name, account_count, eligible_count, claimed_votes)| {
+            WorkerStatistics {
+                telegram_id,
+                display_name,
+                account_count,
+                eligible_count,
+                claimed_votes,
+            }
+        })
+        .collect())
     }
 
     /// Step 2 of registration: Submits OTP to target site for verification.

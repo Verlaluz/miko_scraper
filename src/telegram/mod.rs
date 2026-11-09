@@ -198,15 +198,23 @@ async fn handle_command(
                 bot.send_message(msg.chat.id, "⛔ You are not authorized to view worker statistics.")
                     .await?;
             } else {
-                let workers = account_service.worker_account_counts().await?;
+                let workers = account_service.worker_statistics().await?;
                 let report = if workers.is_empty() {
                     "No workers are registered yet.".to_string()
                 } else {
                     let rows = workers
                         .iter()
                         .enumerate()
-                        .map(|(index, (telegram_id, name, count))| {
-                            format!("{}. <b>{}</b> — {} account(s) (<code>{}</code>)", index + 1, name, count, telegram_id)
+                        .map(|(index, worker)| {
+                            format!(
+                                "{}. <b>{}</b> — {} account(s), {} eligible, {} claimed vote(s) (<code>{}</code>)",
+                                index + 1,
+                                worker.display_name,
+                                worker.account_count,
+                                worker.eligible_count,
+                                worker.claimed_votes,
+                                worker.telegram_id
+                            )
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
