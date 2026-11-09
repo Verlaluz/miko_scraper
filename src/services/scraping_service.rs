@@ -88,7 +88,29 @@ impl ScrapingService {
             .map(|dt| dt.with_timezone(&Utc));
 
         let now = Utc::now();
-        Ok(calculate_cooldown(phone_account_id, last_time, now))
+        let mut cooldown = calculate_cooldown(phone_account_id, last_time, now);
+        let retry_after: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT retry_after FROM scraping_history
+             WHERE phone_account_id = ? AND scraping_status = 'FAILED' AND retry_after IS NOT NULL
+             ORDER BY scraping_completed_at DESC LIMIT 1",
+        )
+        .bind(phone_account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(retry_at) = retry_after
+            .and_then(|row| row.0)
+            .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+            .map(|value| value.with_timezone(&Utc))
+        {
+            if retry_at > now && (cooldown.is_eligible || Some(retry_at) < cooldown.next_eligible_at) {
+                cooldown.is_eligible = false;
+                cooldown.next_eligible_at = Some(retry_at);
+                cooldown.remaining_seconds = (retry_at - now).num_seconds().max(0);
+            }
+        }
+
+        Ok(cooldown)
     }
 
     /// Executes the complete scraping pipeline with strict concurrency guards,
@@ -205,11 +227,17 @@ impl ScrapingService {
                 let err_msg = err.to_string();
                 sqlx::query(
                     "UPDATE scraping_history 
-                     SET scraping_completed_at = ?, scraping_status = 'FAILED', error_message = ? 
+                     SET scraping_completed_at = ?, scraping_status = 'FAILED', error_message = ?,
+                         retry_after = ?
                      WHERE id = ?"
                 )
                 .bind(completed_at.to_rfc3339())
                 .bind(&err_msg)
+                .bind(if Self::is_transient_scrape_error(&err) {
+                    Some((completed_at + chrono::Duration::hours(1)).to_rfc3339())
+                } else {
+                    None
+                })
                 .bind(history_id)
                 .execute(&self.pool)
                 .await?;
@@ -219,6 +247,17 @@ impl ScrapingService {
                 Err(err)
             }
         }
+    }
+
+    fn is_transient_scrape_error(error: &AppError) -> bool {
+        let message = error.to_string().to_lowercase();
+        message.contains("network error")
+            || message.contains("status 429")
+            || message.contains("status 500")
+            || message.contains("status 501")
+            || message.contains("status 502")
+            || message.contains("status 503")
+            || message.contains("status 504")
     }
 
     /// Fetches the recent scraping history for a specific phone account.
