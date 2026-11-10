@@ -47,6 +47,8 @@ pub enum Command {
     Check,
     #[command(description = "Show 20-minute operational activity report.")]
     Rep,
+    #[command(description = "Show number of claimed and not claimed accounts.")]
+    Claim,
     #[command(description = "View real-time voting eligibility for all accounts.")]
     Status,
     #[command(description = "Show accounts eligible to vote now.")]
@@ -137,6 +139,7 @@ async fn handle_command(
                 /pay — Show new accounts from the last 12 hours for payment (admins only)\n\
                 /check — Show new and updated worker accounts (admins only)\n\
                 /rep — Show 20-minute operational report (admins only)\n\
+                /claim — Show claimed and not claimed counts (admins only)\n\
                 /cancel — Cancel current action\n\
                 /help — Show this help message";
             bot.send_message(msg.chat.id, welcome)
@@ -147,7 +150,7 @@ async fn handle_command(
             bot.send_message(msg.chat.id, "⛔ The /status command is available to administrators only.")
                 .await?;
         }
-        Command::Eligible | Command::Cooldown | Command::Health | Command::Rep
+        Command::Eligible | Command::Cooldown | Command::Health | Command::Rep | Command::Claim
             if !is_admin(&msg, &admin_telegram_ids) =>
         {
             bot.send_message(
@@ -381,6 +384,101 @@ async fn handle_command(
                             .await?;
                     }
                 }
+            }
+        }
+        Command::Claim => {
+            if !is_admin(&msg, &admin_telegram_ids) {
+                bot.send_message(
+                    msg.chat.id,
+                    "⛔ This command is available to administrators only.",
+                )
+                .await?;
+            } else {
+                let all_accounts = account_service.list_accounts().await?;
+                if all_accounts.is_empty() {
+                    bot.send_message(msg.chat.id, "ℹ️ No accounts registered yet.")
+                        .await?;
+                    return Ok(());
+                }
+
+                let mut verified_accounts = Vec::new();
+                let mut pending_otp_count = 0;
+                for acc in all_accounts {
+                    if acc.registration_status == crate::models::RegistrationStatus::Verified {
+                        verified_accounts.push(acc);
+                    } else {
+                        pending_otp_count += 1;
+                    }
+                }
+
+                let total_verified = verified_accounts.len();
+                let statuses = scraping_service
+                    .get_all_accounts_vote_status(&verified_accounts)
+                    .await?;
+
+                let mut claimed_count = 0;
+                let mut not_claimed_accounts = Vec::new();
+
+                for status in statuses {
+                    if status.is_eligible {
+                        not_claimed_accounts.push(status);
+                    } else {
+                        claimed_count += 1;
+                    }
+                }
+                let not_claimed_count = not_claimed_accounts.len();
+
+                let claimed_pct = if total_verified > 0 {
+                    (claimed_count as f64 / total_verified as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let not_claimed_pct = if total_verified > 0 {
+                    (not_claimed_count as f64 / total_verified as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                let mut response = format!(
+                    "⚡ <b>Daily Claim Status</b>\n\n\
+                    👥 <b>Total Verified Accounts:</b> {}\n\
+                    ✅ <b>Claimed:</b> {} ({:.1}%)\n\
+                    ⏳ <b>Not Claimed:</b> {} ({:.1}%)\n",
+                    total_verified,
+                    claimed_count,
+                    claimed_pct,
+                    not_claimed_count,
+                    not_claimed_pct
+                );
+
+                if pending_otp_count > 0 {
+                    response.push_str(&format!("📱 <b>Pending OTP Accounts:</b> {}\n", pending_otp_count));
+                }
+
+                if !not_claimed_accounts.is_empty() && not_claimed_accounts.len() <= 10 {
+                    response.push_str("\n<b>Unclaimed accounts:</b>\n");
+                    for acc in &not_claimed_accounts {
+                        let label = acc.label.as_deref().unwrap_or("Account");
+                        response.push_str(&format!(
+                            "• {} (#{}) — <code>{}</code>\n",
+                            label, acc.account_id, acc.phone_number
+                        ));
+                    }
+                } else if not_claimed_accounts.len() > 10 {
+                    response.push_str(&format!(
+                        "\n<i>Use /eligible to view all {} unclaimed accounts.</i>\n",
+                        not_claimed_count
+                    ));
+                }
+
+                response.push_str(&format!(
+                    "\n🕒 <b>Daily Reset:</b> 00:00 UTC\n\
+                     ⏰ <b>Daily Run Time:</b> 02:00 UTC"
+                ));
+
+                bot.send_message(msg.chat.id, response)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await?;
             }
         }
         Command::Status | Command::Eligible | Command::Cooldown => {

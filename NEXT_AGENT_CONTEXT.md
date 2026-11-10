@@ -16,7 +16,7 @@
 - **Initial Pass & Catch-Up**: On startup, any account whose `next_eligible_at` is in the past is processed immediately.
 - **Inter-record Stagger & Retries**: 2–5 second random delay between records, with up to 3 retries (10s, 20s, 40s) on failure.
 - All date/time calculations and storage use UTC (`DateTime<Utc>`).
-- Admin commands `/rep`, `/pay`, `/check`, and `/admin` are live in Telegram.
+- Admin commands `/rep`, `/pay`, `/check`, `/admin`, and `/claim` are live in Telegram.
 
 ## Validation Commands
 
