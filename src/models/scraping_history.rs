@@ -8,6 +8,7 @@ use sqlx::FromRow;
 pub enum ScrapingStatus {
     Running,
     Success,
+    AlreadyVoted,
     Failed,
 }
 
@@ -27,6 +28,10 @@ pub struct ScrapingRecord {
     pub scraping_status: ScrapingStatus,
     pub records_scraped: i64,
     pub error_message: Option<String>,
+    pub response_status: Option<i64>,
+    pub response_body: Option<String>,
+    pub public_vote_count_before: Option<i64>,
+    pub public_vote_count_after: Option<i64>,
 }
 
 /// Information returned to the frontend indicating eligibility and cooldown.

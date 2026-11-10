@@ -1,9 +1,9 @@
 use crate::auth::session::{decrypt_and_unpack_session, validate_and_refresh_session};
 use crate::errors::AppError;
 use crate::models::{AuthenticationSession, PhoneAccount, ScrapeCooldownInfo, ScrapingRecord, ScrapingStatus};
-use crate::scheduler::rate_limit::calculate_cooldown;
+use crate::scheduler::rate_limit::{calculate_cooldown, next_daily_run_utc};
 use crate::scraper::engine::ScraperEngine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -68,33 +68,77 @@ impl ScrapingService {
 
     /// Synchronizes live voting status for an account from the target website.
     pub async fn sync_account_status(&self, phone_account_id: i64) -> Result<ScrapingRecord, AppError> {
-        self.execute_scraping_flow(phone_account_id).await
+        self.execute_scraping_flow(phone_account_id, false).await
     }
 
-    /// Evaluates the 12-hour cooldown status for a specific phone account.
+    /// Evaluates the per-account cooldown status using UTC day-boundary rules.
+    /// An account is eligible when it has never acted, or when its last
+    /// successful completion occurred before today's 00:00 UTC boundary.
     pub async fn get_cooldown_status(&self, phone_account_id: i64) -> Result<ScrapeCooldownInfo, AppError> {
-        let last_record: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT scraping_completed_at FROM scraping_history 
-             WHERE phone_account_id = ? AND scraping_status = 'SUCCESS' 
+        // Prefer the explicit per-account next_eligible_at that was stored after the
+        // last completed job (set by Rule A or Rule B). Fall back to deriving it from
+        // scraping_completed_at when the column is not yet populated (e.g., old rows).
+        let last_record: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT scraping_completed_at, next_eligible_at
+             FROM scraping_history
+             WHERE phone_account_id = ? AND scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
              ORDER BY scraping_completed_at DESC LIMIT 1"
         )
         .bind(phone_account_id)
         .fetch_optional(&self.pool)
         .await?;
 
-        let last_time: Option<DateTime<Utc>> = last_record
-            .and_then(|r| r.0)
-            .and_then(|ts| DateTime::parse_from_rfc3339(&ts).ok())
-            .map(|dt| dt.with_timezone(&Utc));
-
         let now = Utc::now();
+
+        // If a stored next_eligible_at exists, use it directly for eligibility.
+        if let Some((_, Some(next_str))) = &last_record {
+            if let Ok(next) = DateTime::parse_from_rfc3339(next_str).map(|d| d.with_timezone(&Utc)) {
+                let last_time = last_record
+                    .as_ref()
+                    .and_then(|(ts, _)| ts.as_deref())
+                    .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                    .map(|d| d.with_timezone(&Utc));
+
+                let is_eligible = now >= next;
+                let remaining = if is_eligible { 0 } else { (next - now).num_seconds().max(0) };
+                let mut cooldown = ScrapeCooldownInfo {
+                    phone_account_id,
+                    is_eligible,
+                    last_scraping_at: last_time,
+                    next_eligible_at: Some(next),
+                    remaining_seconds: remaining,
+                };
+
+                // Still honour transient retry_after overrides.
+                self.apply_retry_after_override(&mut cooldown, now).await?;
+                return Ok(cooldown);
+            }
+        }
+
+        // Fallback: derive eligibility from scraping_completed_at via day-boundary rules.
+        let last_time: Option<DateTime<Utc>> = last_record
+            .and_then(|(ts, _)| ts)
+            .and_then(|ts| DateTime::parse_from_rfc3339(&ts).ok())
+            .map(|d| d.with_timezone(&Utc));
+
         let mut cooldown = calculate_cooldown(phone_account_id, last_time, now);
+        self.apply_retry_after_override(&mut cooldown, now).await?;
+        Ok(cooldown)
+    }
+
+    /// Applies a transient retry_after from a recent FAILED record if it overrides
+    /// the standard eligibility window. This handles 429/5xx back-off for a specific account.
+    async fn apply_retry_after_override(
+        &self,
+        cooldown: &mut ScrapeCooldownInfo,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
         let retry_after: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT retry_after FROM scraping_history
              WHERE phone_account_id = ? AND scraping_status = 'FAILED' AND retry_after IS NOT NULL
              ORDER BY scraping_completed_at DESC LIMIT 1",
         )
-        .bind(phone_account_id)
+        .bind(cooldown.phone_account_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -109,13 +153,29 @@ impl ScrapingService {
                 cooldown.remaining_seconds = (retry_at - now).num_seconds().max(0);
             }
         }
-
-        Ok(cooldown)
+        Ok(())
     }
 
     /// Executes the complete scraping pipeline with strict concurrency guards,
-    /// 12-hour cooldown enforcement, persistent session decryption, and audit logging.
+    /// per-account UTC day-boundary eligibility, persistent session decryption, and audit logging.
     pub async fn start_scraping(&self, phone_account_id: i64) -> Result<ScrapingRecord, AppError> {
+        self.start_scraping_internal(phone_account_id, false).await
+    }
+
+    /// Performs one live website probe after successful OTP re-authentication.
+    /// This bypasses only the stale local cooldown for this explicit operation.
+    pub async fn start_scraping_after_reauthentication(
+        &self,
+        phone_account_id: i64,
+    ) -> Result<ScrapingRecord, AppError> {
+        self.start_scraping_internal(phone_account_id, true).await
+    }
+
+    async fn start_scraping_internal(
+        &self,
+        phone_account_id: i64,
+        bypass_cooldown: bool,
+    ) -> Result<ScrapingRecord, AppError> {
         // 1. Acquire in-memory lock to prevent concurrent scrapes for the same phone account
         {
             let mut active = self.active_jobs.write().await;
@@ -127,7 +187,9 @@ impl ScrapingService {
 
         // Use a deferred cleanup pattern to ensure the lock is always removed even on error
         let active_jobs_ref = Arc::clone(&self.active_jobs);
-        let result = self.execute_scraping_flow(phone_account_id).await;
+        let result = self
+            .execute_scraping_flow(phone_account_id, bypass_cooldown)
+            .await;
 
         // Release the lock
         {
@@ -138,17 +200,28 @@ impl ScrapingService {
         result
     }
 
-    async fn execute_scraping_flow(&self, phone_account_id: i64) -> Result<ScrapingRecord, AppError> {
+    async fn execute_scraping_flow(
+        &self,
+        phone_account_id: i64,
+        bypass_cooldown: bool,
+    ) -> Result<ScrapingRecord, AppError> {
         // 2. Atomic 12-Hour Cooldown Verification
-        let cooldown = self.get_cooldown_status(phone_account_id).await?;
-        if !cooldown.is_eligible {
-            return Err(AppError::CooldownActive {
-                remaining_seconds: cooldown.remaining_seconds,
-                next_eligible_at_utc: cooldown
-                    .next_eligible_at
-                    .map(|d| d.to_rfc3339())
-                    .unwrap_or_default(),
-            });
+        if !bypass_cooldown {
+            let cooldown = self.get_cooldown_status(phone_account_id).await?;
+            if !cooldown.is_eligible {
+                return Err(AppError::CooldownActive {
+                    remaining_seconds: cooldown.remaining_seconds,
+                    next_eligible_at_utc: cooldown
+                        .next_eligible_at
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_default(),
+                });
+            }
+        } else {
+            tracing::warn!(
+                "Running one explicit post-reauthentication website probe for account #{}; local cooldown bypassed.",
+                phone_account_id
+            );
         }
 
         // 3. Retrieve and Validate Persistent Authentication Session
@@ -195,22 +268,50 @@ impl ScrapingService {
 
         match scrape_res {
             Ok(data) => {
-                // Record success
+                let status = if data.already_voted {
+                    "ALREADY_VOTED"
+                } else {
+                    "SUCCESS"
+                };
+                let records_scraped = if data.already_voted { 0 } else { data.records_count };
+
+                // Single timer rule: after a confirmed outcome (success or already-voted),
+                // set next_eligible_at to the next 02:00 UTC.  This is the shared daily
+                // run time for all accounts, two hours after the website's 00:00 UTC reset.
+                // The timer is started only now that the outcome is confirmed.
+                let next_eligible_at = next_daily_run_utc(completed_at);
+
+                tracing::info!(
+                    "Account #{}: {} — next eligible at {} UTC.",
+                    phone_account_id,
+                    status,
+                    next_eligible_at.format("%Y-%m-%dT%H:%M:%SZ")
+                );
+
                 sqlx::query(
                     "UPDATE scraping_history 
-                     SET scraping_completed_at = ?, scraping_status = 'SUCCESS', records_scraped = ?, error_message = NULL 
+                     SET scraping_completed_at = ?, scraping_status = ?, records_scraped = ?, error_message = NULL
+                         , response_status = ?, response_body = ?, public_vote_count_before = ?, public_vote_count_after = ?
+                         , next_eligible_at = ?
                      WHERE id = ?"
                 )
                 .bind(completed_at.to_rfc3339())
-                .bind(data.records_count)
+                .bind(status)
+                .bind(records_scraped)
+                .bind(data.response_status)
+                .bind(Self::truncate_response_body(&data.response_body))
+                .bind(data.public_vote_count_before)
+                .bind(data.public_vote_count_after)
+                .bind(next_eligible_at.to_rfc3339())
                 .bind(history_id)
                 .execute(&self.pool)
                 .await?;
 
                 tracing::info!(
-                    "Scraping job #{} succeeded with {} records scraped.",
+                    "Scraping job #{} completed with status {} and {} new records.",
                     history_id,
-                    data.records_count
+                    status,
+                    records_scraped
                 );
 
                 Ok(ScrapingRecord {
@@ -218,26 +319,45 @@ impl ScrapingService {
                     phone_account_id,
                     scraping_started_at: started_at,
                     scraping_completed_at: Some(completed_at),
-                    scraping_status: ScrapingStatus::Success,
-                    records_scraped: data.records_count,
+                    scraping_status: if data.already_voted {
+                        ScrapingStatus::AlreadyVoted
+                    } else {
+                        ScrapingStatus::Success
+                    },
+                    records_scraped,
                     error_message: None,
+                    response_status: Some(i64::from(data.response_status)),
+                    response_body: Some(data.response_body),
+                    public_vote_count_before: data.public_vote_count_before,
+                    public_vote_count_after: data.public_vote_count_after,
                 })
             }
             Err(err) => {
                 let err_msg = err.to_string();
+                let response = match &err {
+                    AppError::ScraperResponse { status, body } => {
+                        Some((i64::from(*status), Self::truncate_response_body(body)))
+                    }
+                    _ => None,
+                };
                 sqlx::query(
                     "UPDATE scraping_history 
                      SET scraping_completed_at = ?, scraping_status = 'FAILED', error_message = ?,
-                         retry_after = ?
+                         retry_after = ?, response_status = ?, response_body = ?,
+                         public_vote_count_before = ?, public_vote_count_after = ?
                      WHERE id = ?"
                 )
                 .bind(completed_at.to_rfc3339())
                 .bind(&err_msg)
                 .bind(if Self::is_transient_scrape_error(&err) {
-                    Some((completed_at + chrono::Duration::hours(1)).to_rfc3339())
+                    Some((completed_at + Duration::hours(1)).to_rfc3339())
                 } else {
                     None
                 })
+                .bind(response.as_ref().map(|(status, _)| *status))
+                .bind(response.as_ref().map(|(_, body)| body))
+                .bind(None::<i64>)
+                .bind(None::<i64>)
                 .bind(history_id)
                 .execute(&self.pool)
                 .await?;
@@ -260,10 +380,23 @@ impl ScrapingService {
             || message.contains("status 504")
     }
 
+    fn truncate_response_body(body: &str) -> String {
+        const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024;
+        if body.len() <= MAX_RESPONSE_BODY_BYTES {
+            return body.to_string();
+        }
+
+        let mut end = MAX_RESPONSE_BODY_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...[truncated]", &body[..end])
+    }
+
     /// Fetches the recent scraping history for a specific phone account.
     pub async fn get_history(&self, phone_account_id: i64, limit: i64) -> Result<Vec<ScrapingRecord>, AppError> {
         let records = sqlx::query_as::<_, ScrapingRecord>(
-            "SELECT id, phone_account_id, scraping_started_at, scraping_completed_at, scraping_status, records_scraped, error_message 
+            "SELECT id, phone_account_id, scraping_started_at, scraping_completed_at, scraping_status, records_scraped, error_message, response_status, response_body, public_vote_count_before, public_vote_count_after
              FROM scraping_history 
              WHERE phone_account_id = ? 
              ORDER BY id DESC LIMIT ?"

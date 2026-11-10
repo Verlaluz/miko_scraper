@@ -1,8 +1,8 @@
 use crate::auth::otp::OtpProvider;
 use crate::auth::session::pack_and_encrypt_session;
 use crate::errors::AppError;
-use crate::models::{AuthenticationSession, PhoneAccount, RegistrationStatus, SessionPayload, SessionStatus};
-use chrono::Utc;
+use crate::models::{AuthenticationSession, PhoneAccount, RegistrationStatus, SessionPayload};
+use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
@@ -25,6 +25,32 @@ pub struct PendingOtpAccount {
     pub phone_number: String,
     pub worker_name: Option<String>,
     pub worker_telegram_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerCheckAccount {
+    pub id: i64,
+    pub phone_number: String,
+    pub worker_name: String,
+    pub worker_telegram_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerClaimStat {
+    pub display_name: String,
+    pub telegram_id: Option<i64>,
+    pub claimed_accounts: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivityReport20m {
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    pub new_accounts_count: i64,
+    pub claimed_accounts_count: i64,
+    pub worker_claim_stats: Vec<WorkerClaimStat>,
 }
 
 impl AccountService {
@@ -89,13 +115,13 @@ impl AccountService {
         Self::normalize_phone(input)
     }
 
-    /// Step 1 of registration: Normalizes phone, checks if already verified,
-    /// dispatches OTP via target provider, and ensures an account row exists in `PENDING_OTP` state.
+    /// Step 1 of registration: creates one account row and dispatches its OTP.
+    /// Existing phone numbers cannot be re-registered if they have an active session.
+    /// New accounts are identified by phone_accounts.created_at; updating an existing account preserves created_at.
     pub async fn initiate_registration(&self, raw_phone: &str) -> Result<String, AppError> {
         let phone = self.normalize_phone_number(raw_phone)?;
         let now = Utc::now();
 
-        // Check if an existing account exists
         let existing = sqlx::query_as::<_, PhoneAccount>(
             "SELECT id, phone_number, label, registration_status, created_at, updated_at FROM phone_accounts WHERE phone_number = ?"
         )
@@ -104,7 +130,6 @@ impl AccountService {
         .await?;
 
         if let Some(acc) = existing {
-            // If already verified, check if it has an active session
             if acc.registration_status == RegistrationStatus::Verified {
                 let has_session: Option<(i64,)> = sqlx::query_as(
                     "SELECT id FROM authentication_sessions WHERE phone_account_id = ? AND session_status = 'ACTIVE' LIMIT 1"
@@ -121,8 +146,8 @@ impl AccountService {
                 }
             }
 
-            // Otherwise, update updated_at and allow re-verification
-            sqlx::query("UPDATE phone_accounts SET updated_at = ? WHERE id = ?")
+            // Otherwise, update updated_at and allow re-verification while preserving original created_at
+            sqlx::query("UPDATE phone_accounts SET registration_status = 'PENDING_OTP', updated_at = ? WHERE id = ?")
                 .bind(now.to_rfc3339())
                 .bind(acc.id)
                 .execute(&self.pool)
@@ -152,7 +177,7 @@ impl AccountService {
         telegram_id: i64,
     ) -> Result<(), AppError> {
         let phone = self.normalize_phone_number(raw_phone)?;
-        sqlx::query("UPDATE phone_accounts SET added_by_telegram_id = ? WHERE phone_number = ?")
+        sqlx::query("UPDATE phone_accounts SET added_by_telegram_id = ? WHERE phone_number = ? AND added_by_telegram_id IS NULL")
             .bind(telegram_id)
             .bind(phone)
             .execute(&self.pool)
@@ -190,7 +215,46 @@ impl AccountService {
              LEFT JOIN (
                 SELECT phone_account_id, MAX(scraping_completed_at) AS completed_at
                 FROM scraping_history
-                WHERE scraping_status = 'SUCCESS'
+                WHERE scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
+                GROUP BY phone_account_id
+             ) latest ON latest.phone_account_id = a.id
+             GROUP BY w.telegram_id, w.display_name
+             ORDER BY account_count DESC, w.display_name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(telegram_id, display_name, account_count, cooldown_count)| {
+            WorkerStatistics {
+                telegram_id,
+                display_name,
+                account_count,
+                cooldown_count,
+            }
+        })
+        .collect())
+    }
+
+    /// Returns accounts first registered by each worker during the last 12 hours.
+    pub async fn payment_statistics(&self) -> Result<Vec<WorkerStatistics>, AppError> {
+        Ok(sqlx::query_as::<_, (i64, String, i64, i64)>(
+            "SELECT w.telegram_id,
+                    w.display_name,
+                    COUNT(DISTINCT a.id) AS account_count,
+                    SUM(CASE
+                        WHEN a.registration_status = 'VERIFIED'
+                         AND latest.completed_at IS NOT NULL
+                         AND datetime(latest.completed_at, '+12 hours') > datetime('now')
+                        THEN 1 ELSE 0
+                    END) AS cooldown_count
+             FROM telegram_workers w
+             INNER JOIN phone_accounts a
+                 ON a.added_by_telegram_id = w.telegram_id
+                AND datetime(a.created_at) >= datetime('now', '-12 hours')
+             LEFT JOIN (
+                SELECT phone_account_id, MAX(scraping_completed_at) AS completed_at
+                FROM scraping_history
+                WHERE scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
                 GROUP BY phone_account_id
              ) latest ON latest.phone_account_id = a.id
              GROUP BY w.telegram_id, w.display_name
@@ -227,6 +291,105 @@ impl AccountService {
             worker_telegram_id,
         })
         .collect())
+    }
+
+    pub async fn worker_check_accounts(&self) -> Result<(Vec<WorkerCheckAccount>, Vec<WorkerCheckAccount>), AppError> {
+        let rows = sqlx::query_as::<_, (i64, String, String, Option<i64>, String, String, i64)>(
+            "SELECT a.id, a.phone_number, COALESCE(w.display_name, 'Unassigned worker'),
+                    w.telegram_id,
+                    a.created_at, a.updated_at,
+                    CASE WHEN date(a.created_at) = date('now', 'utc') THEN 1 ELSE 0 END AS is_new
+             FROM phone_accounts a
+             LEFT JOIN telegram_workers w ON w.telegram_id = a.added_by_telegram_id
+             WHERE a.added_by_telegram_id IS NOT NULL
+               AND (date(a.created_at) = date('now', 'utc')
+                    OR date(a.updated_at) = date('now', 'utc'))
+             ORDER BY a.updated_at DESC, a.id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut new_accounts = Vec::new();
+        let mut updated_accounts = Vec::new();
+        for (id, phone_number, worker_name, worker_telegram_id, created_at, updated_at, is_new) in rows {
+            let account = WorkerCheckAccount {
+                id,
+                phone_number,
+                worker_name,
+                worker_telegram_id,
+                created_at,
+                updated_at,
+            };
+            if is_new == 1 {
+                new_accounts.push(account);
+            } else {
+                updated_accounts.push(account);
+            }
+        }
+        Ok((new_accounts, updated_accounts))
+    }
+
+    /// Generates a summary of newly registered accounts and status-201 claims in the last 20 minutes.
+    pub async fn activity_report_20m(&self) -> Result<ActivityReport20m, AppError> {
+        let end_time = Utc::now();
+        let start_time = end_time - chrono::Duration::minutes(20);
+        let start_str = start_time.to_rfc3339();
+        let end_str = end_time.to_rfc3339();
+
+        let (new_accounts_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM phone_accounts
+             WHERE datetime(created_at) >= datetime(?) AND datetime(created_at) <= datetime(?)"
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let (claimed_accounts_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT phone_account_id) FROM scraping_history
+             WHERE response_status = 201
+               AND datetime(COALESCE(scraping_completed_at, scraping_started_at)) >= datetime(?)
+               AND datetime(COALESCE(scraping_completed_at, scraping_started_at)) <= datetime(?)"
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let worker_rows = sqlx::query_as::<_, (String, Option<i64>, i64)>(
+            "SELECT COALESCE(w.display_name, 'Direct / Admin') AS name,
+                    w.telegram_id,
+                    COUNT(DISTINCT a.id) AS claimed_accounts
+             FROM scraping_history h
+             INNER JOIN phone_accounts a ON a.id = h.phone_account_id
+             LEFT JOIN telegram_workers w ON w.telegram_id = a.added_by_telegram_id
+             WHERE h.response_status = 201
+               AND datetime(COALESCE(h.scraping_completed_at, h.scraping_started_at)) >= datetime(?)
+               AND datetime(COALESCE(h.scraping_completed_at, h.scraping_started_at)) <= datetime(?)
+             GROUP BY w.telegram_id, w.display_name
+             ORDER BY claimed_accounts DESC, name ASC"
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let worker_claim_stats = worker_rows
+            .into_iter()
+            .map(|(display_name, telegram_id, claimed_accounts)| WorkerClaimStat {
+                display_name,
+                telegram_id,
+                claimed_accounts,
+            })
+            .collect();
+
+        Ok(ActivityReport20m {
+            start_time,
+            end_time,
+            new_accounts_count,
+            claimed_accounts_count,
+            worker_claim_stats,
+        })
     }
 
     /// Step 2 of registration: Submits OTP to target site for verification.

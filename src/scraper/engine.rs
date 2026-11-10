@@ -9,6 +9,11 @@ use std::time::Duration;
 pub struct ScrapeResult {
     pub records_count: i64,
     pub sample_data: Vec<String>,
+    pub response_status: u16,
+    pub response_body: String,
+    pub already_voted: bool,
+    pub public_vote_count_before: Option<i64>,
+    pub public_vote_count_after: Option<i64>,
 }
 
 #[async_trait]
@@ -59,6 +64,54 @@ struct ClaimVoteResponse {
     funding_source: Option<String>,
 }
 
+impl CreativeAwardsScraperEngine {
+    async fn fetch_public_vote_count(
+        &self,
+        category_id: &str,
+        nominee_id: &str,
+    ) -> Result<i64, AppError> {
+        let url = format!("{}/api/engage/results", self.base_url);
+        let response = self
+            .client
+            .get(url)
+            .query(&[("category_id", category_id)])
+            .send()
+            .await
+            .map_err(|e| AppError::Scraper(format!("Network error while reading public vote count: {}", e)))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| AppError::Scraper(format!("Failed to read public vote count response: {}", e)))?;
+        if !status.is_success() {
+            return Err(AppError::Scraper(format!(
+                "Public vote count endpoint returned HTTP {}: {}",
+                status, body
+            )));
+        }
+
+        let payload: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| AppError::Scraper(format!("Invalid public vote count response: {}", e)))?;
+        payload["data"]
+            .as_array()
+            .and_then(|categories| categories.first())
+            .and_then(|category| category["nominees"].as_array())
+            .and_then(|nominees| {
+                nominees
+                    .iter()
+                    .find(|nominee| nominee["id"].as_str() == Some(nominee_id))
+            })
+            .and_then(|nominee| nominee["votes"].as_i64())
+            .ok_or_else(|| {
+                AppError::Scraper(format!(
+                    "Public vote count response did not contain nominee {}",
+                    nominee_id
+                ))
+            })
+    }
+}
+
 #[async_trait]
 impl ScraperEngine for CreativeAwardsScraperEngine {
     async fn scrape(&self, session: &SessionPayload) -> Result<ScrapeResult, AppError> {
@@ -90,6 +143,22 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
             self.default_category_id
         );
 
+        let mut sample_data = Vec::new();
+        let public_vote_count_before = match self
+            .fetch_public_vote_count(&self.default_category_id, &self.default_nominee_id)
+            .await
+        {
+            Ok(count) => {
+                sample_data.push(format!("Public vote count before claim: {}", count));
+                Some(count)
+            }
+            Err(error) => {
+                sample_data.push(format!("Public vote count before claim unavailable: {}", error));
+                tracing::warn!("{}", error);
+                None
+            }
+        };
+
         // 1. Send the automated Claim Free Vote POST request
         let vote_url = format!("{}/api/engage/votes", self.base_url);
         let vote_res = self
@@ -107,8 +176,8 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
         let status = vote_res.status();
         let body_text = vote_res.text().await.unwrap_or_default();
 
-        let mut sample_data = Vec::new();
         let mut records_count = 0;
+        let mut already_voted = false;
 
         if status.is_success() {
             let parsed: Option<ClaimVoteResponse> = serde_json::from_str(&body_text).ok();
@@ -134,19 +203,18 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
 
             let lower = body_text.to_lowercase();
             // CreativeAwards sends 409 Conflict when already voted today!
-            if status.as_u16() == 409
-                || lower.contains("already cast")
+            if lower.contains("already cast")
                 || lower.contains("already claimed") 
                 || lower.contains("already voted") 
             {
-                records_count = 5; // They already have their 5 votes today
-                sample_data.push("Free vote was already cast for this nominee today. 12-hour cooldown activated.".to_string());
-                tracing::info!("Account already cast its vote today. Activating 12-hour cooldown.");
+                already_voted = true;
+                sample_data.push("Free vote was already cast for this nominee today. No new votes added; 12-hour cooldown retained.".to_string());
+                tracing::info!("Account already cast its vote today. No new votes added; retaining the 12-hour cooldown.");
             } else {
-                return Err(AppError::Scraper(format!(
-                    "Vote claim failed (Status {}): {}",
-                    status, body_text
-                )));
+                return Err(AppError::ScraperResponse {
+                    status: status.as_u16(),
+                    body: body_text,
+                });
             }
         }
 
@@ -158,9 +226,29 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
             }
         }
 
+        let public_vote_count_after = match self
+            .fetch_public_vote_count(&self.default_category_id, &self.default_nominee_id)
+            .await
+        {
+            Ok(count) => {
+                sample_data.push(format!("Public vote count after claim: {}", count));
+                Some(count)
+            }
+            Err(error) => {
+                sample_data.push(format!("Public vote count after claim unavailable: {}", error));
+                tracing::warn!("{}", error);
+                None
+            }
+        };
+
         Ok(ScrapeResult {
             records_count,
             sample_data,
+            response_status: status.as_u16(),
+            response_body: body_text,
+            already_voted,
+            public_vote_count_before,
+            public_vote_count_after,
         })
     }
 }

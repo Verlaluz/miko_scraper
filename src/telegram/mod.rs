@@ -1,5 +1,7 @@
 use crate::services::{AccountService, ScrapingService};
+use crate::models::ScrapingRecord;
 use crate::services::scraping_service::AccountVoteStatus;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use teloxide::{
     dispatching::dialogue::InMemStorage,
@@ -39,6 +41,12 @@ pub enum Command {
     Adminregister(String),
     #[command(description = "Show worker account counts.")]
     Admin,
+    #[command(description = "Show new accounts from the last 12 hours for payment.")]
+    Pay,
+    #[command(description = "Show new and updated worker accounts.")]
+    Check,
+    #[command(description = "Show 20-minute operational activity report.")]
+    Rep,
     #[command(description = "View real-time voting eligibility for all accounts.")]
     Status,
     #[command(description = "Show accounts eligible to vote now.")]
@@ -126,6 +134,9 @@ async fn handle_command(
                 /register — Add a phone number & receive OTP\n\
                 /worker — Become a worker and track your accounts\n\
                 /admin — Show worker account counts (admins only)\n\
+                /pay — Show new accounts from the last 12 hours for payment (admins only)\n\
+                /check — Show new and updated worker accounts (admins only)\n\
+                /rep — Show 20-minute operational report (admins only)\n\
                 /cancel — Cancel current action\n\
                 /help — Show this help message";
             bot.send_message(msg.chat.id, welcome)
@@ -136,7 +147,7 @@ async fn handle_command(
             bot.send_message(msg.chat.id, "⛔ The /status command is available to administrators only.")
                 .await?;
         }
-        Command::Eligible | Command::Cooldown | Command::Health
+        Command::Eligible | Command::Cooldown | Command::Health | Command::Rep
             if !is_admin(&msg, &admin_telegram_ids) =>
         {
             bot.send_message(
@@ -228,6 +239,148 @@ async fn handle_command(
                         ),
                     ]]))
                     .await?;
+            }
+        }
+        Command::Pay => {
+            if !is_admin(&msg, &admin_telegram_ids) {
+                bot.send_message(msg.chat.id, "⛔ You are not authorized to view payment statistics.")
+                    .await?;
+            } else {
+                let workers = account_service.payment_statistics().await?;
+                let report = if workers.is_empty() {
+                    "No new accounts registered in the last 12 hours.".to_string()
+                } else {
+                    let rows = workers
+                        .iter()
+                        .enumerate()
+                        .map(|(index, worker)| {
+                            format!(
+                                "{}. <b>{}</b> — {} account(s), {} cooldown\n(<code>{}</code>)",
+                                index + 1,
+                                worker.display_name,
+                                worker.account_count,
+                                worker.cooldown_count,
+                                worker.telegram_id
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(
+                        "💰 <b>Worker payment accounts (new registrations in the last 12 hours)</b>\n\n{}",
+                        rows
+                    )
+                };
+                if report.len() <= 3800 {
+                    bot.send_message(msg.chat.id, report)
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .await?;
+                } else {
+                    let mut chunk = String::new();
+                    for line in report.lines() {
+                        if chunk.len() + line.len() + 1 > 3800 {
+                            bot.send_message(msg.chat.id, &chunk)
+                                .parse_mode(teloxide::types::ParseMode::Html)
+                                .await?;
+                            chunk.clear();
+                        }
+                        if !chunk.is_empty() {
+                            chunk.push('\n');
+                        }
+                        chunk.push_str(line);
+                    }
+                    if !chunk.is_empty() {
+                        bot.send_message(msg.chat.id, chunk)
+                            .parse_mode(teloxide::types::ParseMode::Html)
+                            .await?;
+                    }
+                }
+            }
+        }
+        Command::Check => {
+            if !is_admin(&msg, &admin_telegram_ids) {
+                bot.send_message(msg.chat.id, "⛔ You are not authorized to use /check.")
+                    .await?;
+            } else {
+                bot.send_message(
+                    msg.chat.id,
+                    "🔎 <b>Worker account check (since 00:00 UTC)</b>\n\nChoose a report:",
+                )
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                    InlineKeyboardButton::callback("🆕 New accounts", "admin:check_new"),
+                    InlineKeyboardButton::callback("🔄 Updated accounts", "admin:check_updated"),
+                ]]))
+                .await?;
+            }
+        }
+        Command::Rep => {
+            if !is_admin(&msg, &admin_telegram_ids) {
+                bot.send_message(msg.chat.id, "⛔ You are not authorized to view this report.")
+                    .await?;
+            } else {
+                let report_data = account_service.activity_report_20m().await?;
+                let start_utc = report_data.start_time.format("%H:%M");
+                let end_utc = report_data.end_time.format("%H:%M");
+                let eat_offset = chrono::FixedOffset::east_opt(3 * 3600).unwrap();
+                let start_eat = report_data.start_time.with_timezone(&eat_offset).format("%H:%M");
+                let end_eat = report_data.end_time.with_timezone(&eat_offset).format("%H:%M");
+
+                let mut text = format!(
+                    "📊 <b>Operational Activity Report (20 Minutes)</b>\n\n\
+                    ⏱ <b>Period:</b>\n\
+                    • <b>UTC:</b> <code>{}</code> — <code>{}</code>\n\
+                    • <b>EAT:</b> <code>{}</code> — <code>{}</code>\n\n\
+                    📱 <b>New Registered Accounts:</b> {}\n\
+                    ⚡ <b>Claimed Accounts (Status 201):</b> {}\n",
+                    start_utc,
+                    end_utc,
+                    start_eat,
+                    end_eat,
+                    report_data.new_accounts_count,
+                    report_data.claimed_accounts_count
+                );
+
+                if !report_data.worker_claim_stats.is_empty() {
+                    text.push_str("\n👷 <b>Worker Activity (Status 201 Claims):</b>\n");
+                    for (i, worker) in report_data.worker_claim_stats.iter().enumerate() {
+                        let id_str = worker
+                            .telegram_id
+                            .map(|id| format!(" (<code>{}</code>)", id))
+                            .unwrap_or_default();
+                        text.push_str(&format!(
+                            "{}. <b>{}</b>{} — {} claimed\n",
+                            i + 1,
+                            worker.display_name,
+                            id_str,
+                            worker.claimed_accounts
+                        ));
+                    }
+                }
+
+                if text.len() <= 3800 {
+                    bot.send_message(msg.chat.id, text)
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .await?;
+                } else {
+                    let mut chunk = String::new();
+                    for line in text.lines() {
+                        if chunk.len() + line.len() + 1 > 3800 {
+                            bot.send_message(msg.chat.id, &chunk)
+                                .parse_mode(teloxide::types::ParseMode::Html)
+                                .await?;
+                            chunk.clear();
+                        }
+                        if !chunk.is_empty() {
+                            chunk.push('\n');
+                        }
+                        chunk.push_str(line);
+                    }
+                    if !chunk.is_empty() {
+                        bot.send_message(msg.chat.id, chunk)
+                            .parse_mode(teloxide::types::ParseMode::Html)
+                            .await?;
+                    }
+                }
             }
         }
         Command::Status | Command::Eligible | Command::Cooldown => {
@@ -481,6 +634,25 @@ async fn handle_status_filter(
     scraping_service: Arc<ScrapingService>,
     admin_telegram_ids: Vec<i64>,
 ) -> HandlerResult {
+    if let Some(data) = query.data.clone() {
+        if data == "admin:check_new" || data == "admin:check_updated" {
+            if !is_admin_callback(&query, &admin_telegram_ids) {
+                bot.answer_callback_query(query.id)
+                    .text("Admins only.")
+                    .show_alert(true)
+                    .await?;
+                return Ok(());
+            }
+            return send_worker_check_report(
+                bot,
+                query,
+                account_service,
+                scraping_service,
+                data == "admin:check_new",
+            )
+            .await;
+        }
+    }
     if data_is_admin_pending_otp(&query, &admin_telegram_ids) {
         bot.answer_callback_query(query.id).await?;
         let pending = account_service.pending_otp_accounts().await?;
@@ -631,6 +803,81 @@ fn data_is_admin_pending_otp(query: &CallbackQuery, admin_telegram_ids: &[i64]) 
         && admin_telegram_ids.contains(&(query.from.id.0 as i64))
 }
 
+fn is_admin_callback(query: &CallbackQuery, admin_telegram_ids: &[i64]) -> bool {
+    admin_telegram_ids.contains(&(query.from.id.0 as i64))
+}
+
+async fn send_worker_check_report(
+    bot: Bot,
+    query: CallbackQuery,
+    account_service: Arc<AccountService>,
+    scraping_service: Arc<ScrapingService>,
+    show_new: bool,
+) -> HandlerResult {
+    bot.answer_callback_query(query.id).await?;
+    let Some(message) = query.message else {
+        return Ok(());
+    };
+    let (new_accounts, updated_accounts) = account_service.worker_check_accounts().await?;
+    let accounts = if show_new {
+        new_accounts
+    } else {
+        updated_accounts
+    };
+    let mut workers = BTreeMap::<String, (i64, i64, i64)>::new();
+    for account in &accounts {
+        let cooldown = scraping_service.get_cooldown_status(account.id).await?;
+        let entry = workers
+            .entry(account.worker_name.clone())
+            .or_insert((0, 0, 0));
+        entry.0 += 1;
+        if !cooldown.is_eligible {
+            entry.1 += 1;
+        }
+        entry.2 = account.worker_telegram_id.unwrap_or_default();
+    }
+
+    let title = if show_new {
+        "🆕 New accounts registered today"
+    } else {
+        "🔄 Existing accounts updated today"
+    };
+    let cooldown_count: i64 = workers.values().map(|value| value.1).sum();
+    let mut report = format!(
+        "<b>{}</b>\nSince 00:00 UTC\n\nTotal: {} account(s)\nCooldown: {}\nEligible: {}\n\n",
+        title, accounts.len(), cooldown_count, accounts.len().saturating_sub(cooldown_count as usize)
+    );
+    if accounts.is_empty() {
+        report.push_str("\nNo matching worker accounts.");
+    } else {
+        for (index, (worker, (count, cooldown, telegram_id))) in workers.iter().enumerate() {
+            report.push_str(&format!(
+                "{}. <b>{}</b> — {} account(s), {} cooldown\n(<code>{}</code>)\n",
+                index + 1,
+                worker,
+                count,
+                cooldown,
+                telegram_id
+            ));
+        }
+    }
+
+    for chunk in report
+        .as_bytes()
+        .chunks(3800)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+    {
+        bot.send_message(message.chat().id, chunk)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback("🆕 New accounts", "admin:check_new"),
+                InlineKeyboardButton::callback("🔄 Updated accounts", "admin:check_updated"),
+            ]]))
+            .await?;
+    }
+    Ok(())
+}
+
 async fn handle_cooldown_filter(
     bot: Bot,
     query: CallbackQuery,
@@ -646,7 +893,7 @@ async fn handle_cooldown_filter(
     let statuses = scraping_service.get_all_accounts_vote_status(&accounts).await?;
     let minimum_seconds = if maximum_minutes == 60 { 30 * 60 } else { 0 };
     let maximum_seconds = maximum_minutes * 60;
-    let filtered: Vec<AccountVoteStatus> = statuses
+    let mut filtered: Vec<AccountVoteStatus> = statuses
         .iter()
         .filter(|status| {
             !status.is_eligible
@@ -655,6 +902,7 @@ async fn handle_cooldown_filter(
         })
         .cloned()
         .collect();
+    filtered.sort_by_key(|status| (status.remaining_seconds, status.account_id));
 
     send_status_report(
         &bot,
@@ -730,7 +978,10 @@ async fn handle_account_search(
     dialogue.update(State::Start).await?;
 
     match status {
-        Some(status) => send_account_detail(&bot, msg.chat.id, status).await?,
+        Some(status) => {
+            let history = scraping_service.get_history(status.account_id, 1).await?;
+            send_account_detail(&bot, msg.chat.id, status, history.first()).await?
+        }
         None => {
             bot.send_message(
                 msg.chat.id,
@@ -765,13 +1016,15 @@ async fn handle_account_detail(
             .await?;
         return Ok(());
     };
-    send_account_detail(&bot, message.chat().id, status).await
+    let history = scraping_service.get_history(status.account_id, 1).await?;
+    send_account_detail(&bot, message.chat().id, status, history.first()).await
 }
 
 async fn send_account_detail(
     bot: &Bot,
     chat_id: ChatId,
     status: &AccountVoteStatus,
+    latest_record: Option<&ScrapingRecord>,
 ) -> HandlerResult {
     let status_text = if status.is_eligible {
         "🟢 Eligible (ready to vote)".to_string()
@@ -783,17 +1036,44 @@ async fn send_account_detail(
         )
     };
     let label = status.label.as_deref().unwrap_or("Unnamed");
+    let verification = latest_record
+        .map(|record| {
+            let before = record
+                .public_vote_count_before
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "Unavailable".to_string());
+            let after = record
+                .public_vote_count_after
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "Unavailable".to_string());
+            let delta = match (record.public_vote_count_before, record.public_vote_count_after) {
+                (Some(before), Some(after)) => format!(" (Δ {:+})", after - before),
+                _ => String::new(),
+            };
+            format!(
+                "\n\n<b>Vote verification</b>\nClaim response: HTTP {}\nPoints recorded: {}\nPublic count: {} → {}{}",
+                record.response_status
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "Unavailable".to_string()),
+                record.records_scraped,
+                before,
+                after,
+                delta
+            )
+        })
+        .unwrap_or_else(|| "\n\n<b>Vote verification</b>\nNo claim record available.".to_string());
     bot.send_message(
         chat_id,
         format!(
-            "👤 <b>Account #{}</b>\n\nLabel: {}\nPhone: <code>{}</code>\nStatus: {}\nLast vote: {}",
+            "👤 <b>Account #{}</b>\n\nLabel: {}\nPhone: <code>{}</code>\nStatus: {}\nLast vote: {}{}",
             status.account_id,
             label,
             status.phone_number,
             status_text,
             status.last_vote_at
                 .map(|value| value.to_rfc3339())
-                .unwrap_or_else(|| "No recorded vote".to_string())
+                .unwrap_or_else(|| "No recorded vote".to_string()),
+            verification
         ),
     )
     .parse_mode(teloxide::types::ParseMode::Html)
@@ -945,11 +1225,36 @@ async fn handle_otp_code(
             .parse_mode(teloxide::types::ParseMode::Html)
             .await?;
 
-            // Trigger an initial vote claim or status sync asynchronously so Telegram doesn't block
+            // Probe the website once with the newly issued token, even if local cooldown is stale.
             let scraping_ref = Arc::clone(&scraping_service);
             let account_id = account.id;
+            let bot_for_probe = bot.clone();
+            let chat_id = msg.chat.id;
             tokio::spawn(async move {
-                let _ = scraping_ref.start_scraping(account_id).await;
+                match scraping_ref
+                    .start_scraping_after_reauthentication(account_id)
+                    .await
+                {
+                    Ok(record) => {
+                        let message = if record.scraping_status
+                            == crate::models::ScrapingStatus::AlreadyVoted
+                        {
+                            "Website response: this account already voted today; no new vote was added."
+                                .to_string()
+                        } else {
+                            format!(
+                                "Website probe completed: {} new vote records reported.",
+                                record.records_scraped
+                            )
+                        };
+                        let _ = bot_for_probe.send_message(chat_id, message).await;
+                    }
+                    Err(error) => {
+                        let _ = bot_for_probe
+                            .send_message(chat_id, format!("Website probe failed: {}", error))
+                            .await;
+                    }
+                }
             });
         }
         Err(e) => {

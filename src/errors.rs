@@ -49,6 +49,9 @@ pub enum AppError {
     #[error("Scraper execution error: {0}")]
     Scraper(String),
 
+    #[error("Scraper response (HTTP {status}): {body}")]
+    ScraperResponse { status: u16, body: String },
+
     #[error("Internal server error: {0}")]
     Internal(String),
 }
@@ -86,6 +89,11 @@ impl IntoResponse for AppError {
             }
             AppError::Config(err) => (StatusCode::INTERNAL_SERVER_ERROR, "CONFIG_ERROR", err.clone()),
             AppError::Scraper(err) => (StatusCode::BAD_GATEWAY, "SCRAPER_ERROR", err.clone()),
+            AppError::ScraperResponse { .. } => (
+                StatusCode::BAD_GATEWAY,
+                "SCRAPER_RESPONSE_ERROR",
+                self.to_string(),
+            ),
             AppError::Internal(err) => {
                 tracing::error!("Internal error: {}", err);
                 (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "An internal error occurred.".to_string())
