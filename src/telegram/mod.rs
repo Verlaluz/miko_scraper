@@ -402,18 +402,13 @@ async fn handle_command(
                 }
 
                 let total_verified = summary.total_verified;
-                let claimed_count = summary.claimed_count;
-                let not_claimed_count = summary.not_claimed_count;
-                let pending_retry_count = summary.pending_retry_count;
-                let pending_otp_count = summary.pending_otp_count;
-
                 let claimed_pct = if total_verified > 0 {
-                    (claimed_count as f64 / total_verified as f64) * 100.0
+                    (summary.total_claimed_count as f64 / total_verified as f64) * 100.0
                 } else {
                     0.0
                 };
                 let not_claimed_pct = if total_verified > 0 {
-                    (not_claimed_count as f64 / total_verified as f64) * 100.0
+                    (summary.not_claimed_count as f64 / total_verified as f64) * 100.0
                 } else {
                     0.0
                 };
@@ -421,24 +416,72 @@ async fn handle_command(
                 let mut response = format!(
                     "⚡ <b>Daily Claim Status</b>\n\n\
                     👥 <b>Total Verified Accounts:</b> {}\n\
-                    ✅ <b>Claimed:</b> {} ({:.1}%)\n\
+                    ✅ <b>Successfully Claimed:</b> {} ({:.1}%)\n\
+                       • 🎁 <b>Fresh Votes (+5 pts):</b> {}\n\
+                       • 🔄 <b>Already Voted Today:</b> {}\n\
                     ⏳ <b>Not Claimed:</b> {} ({:.1}%)\n",
                     total_verified,
-                    claimed_count,
+                    summary.total_claimed_count,
                     claimed_pct,
-                    not_claimed_count,
+                    summary.fresh_claimed_count,
+                    summary.already_voted_count,
+                    summary.not_claimed_count,
                     not_claimed_pct
                 );
 
-                if pending_retry_count > 0 {
+                if summary.failed_accounts_count > 0 {
+                    let failed_pct = if total_verified > 0 {
+                        (summary.failed_accounts_count as f64 / total_verified as f64) * 100.0
+                    } else {
+                        0.0
+                    };
                     response.push_str(&format!(
-                        "🔄 <b>Retrying (1-hr error backoff):</b> {}\n",
-                        pending_retry_count
+                        "\n❌ <b>Errors (1-Hr Retry):</b> {} ({:.1}%)\n",
+                        summary.failed_accounts_count, failed_pct
                     ));
+
+                    // Breakdown by category
+                    let mut cat_counts = std::collections::HashMap::new();
+                    for acc in &summary.failed_accounts {
+                        let cat = simplify_error_category(&acc.error_message);
+                        *cat_counts.entry(cat).or_insert(0usize) += 1;
+                    }
+                    let mut sorted_cats: Vec<_> = cat_counts.into_iter().collect();
+                    sorted_cats.sort_by(|a, b| b.1.cmp(&a.1));
+                    for (cat, count) in sorted_cats {
+                        response.push_str(&format!("   • {}: {}\n", cat, count));
+                    }
+
+                    response.push_str("\n<b>Failed accounts (details):</b>\n");
+                    let now = Utc::now();
+                    for acc in summary.failed_accounts.iter().take(5) {
+                        let label = acc.label.as_deref().unwrap_or("Account");
+                        let snippet = format_error_snippet(&acc.error_message);
+                        let retry_str = if let Some(retry_at) = acc.retry_after {
+                            if retry_at > now {
+                                let mins = ((retry_at - now).num_seconds() + 59) / 60;
+                                format!("retry in {}m", mins)
+                            } else {
+                                "ready to retry".to_string()
+                            }
+                        } else {
+                            "retry pending".to_string()
+                        };
+                        response.push_str(&format!(
+                            "• {} (#{}) — <code>{}</code>\n   └ <i>{}</i> ({})\n",
+                            label, acc.account_id, acc.phone_number, snippet, retry_str
+                        ));
+                    }
+                    if summary.failed_accounts.len() > 5 {
+                        response.push_str(&format!(
+                            "<i>...and {} more in 1-hr error retry.</i>\n",
+                            summary.failed_accounts.len() - 5
+                        ));
+                    }
                 }
 
-                if pending_otp_count > 0 {
-                    response.push_str(&format!("📱 <b>Pending OTP Accounts:</b> {}\n", pending_otp_count));
+                if summary.pending_otp_count > 0 {
+                    response.push_str(&format!("\n📱 <b>Pending OTP Accounts:</b> {}\n", summary.pending_otp_count));
                 }
 
                 let unclaimed_preview = account_service.get_unclaimed_accounts(11).await?;
@@ -454,7 +497,7 @@ async fn handle_command(
                 } else if unclaimed_preview.len() > 10 {
                     response.push_str(&format!(
                         "\n<i>Use /eligible to view all {} unclaimed accounts.</i>\n",
-                        not_claimed_count
+                        summary.not_claimed_count
                     ));
                 }
 
@@ -1353,4 +1396,43 @@ async fn handle_otp_code(
     }
 
     Ok(())
+}
+
+fn simplify_error_category(err: &str) -> &'static str {
+    let lower = err.to_lowercase();
+    if lower.contains("network error") || lower.contains("error sending request") || lower.contains("connection") {
+        "Network error / timeout"
+    } else if lower.contains("429") || lower.contains("too many requests") {
+        "Rate limit (HTTP 429)"
+    } else if lower.contains("session") && (lower.contains("invalid") || lower.contains("missing") || lower.contains("expired")) {
+        "Session invalid / expired"
+    } else if lower.contains("status 5") || lower.contains("500") || lower.contains("502") || lower.contains("503") || lower.contains("504") {
+        "Target server error (5xx)"
+    } else if lower.contains("409") || lower.contains("already cast") || lower.contains("already voted") {
+        "Already voted"
+    } else {
+        "Scraper error"
+    }
+}
+
+fn format_error_snippet(err: &str) -> String {
+    let lower = err.to_lowercase();
+    if lower.contains("network error") || lower.contains("error sending request") {
+        "Network connection error".to_string()
+    } else if lower.contains("timed out") {
+        "Request timed out".to_string()
+    } else if lower.contains("session") && (lower.contains("invalid") || lower.contains("missing")) {
+        "Auth session invalid/expired".to_string()
+    } else if lower.contains("429") {
+        "HTTP 429 Too Many Requests".to_string()
+    } else if lower.contains("status 5") {
+        "Target server 5xx error".to_string()
+    } else {
+        let clean = err.replace('\n', " ").replace('<', "&lt;").replace('>', "&gt;");
+        if clean.len() > 40 {
+            format!("{}...", &clean[..37])
+        } else {
+            clean
+        }
+    }
 }

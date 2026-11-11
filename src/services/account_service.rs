@@ -45,12 +45,25 @@ pub struct WorkerClaimStat {
 }
 
 #[derive(Debug, Clone)]
+pub struct FailedAccountDetail {
+    pub account_id: i64,
+    pub phone_number: String,
+    pub label: Option<String>,
+    pub error_message: String,
+    pub response_status: Option<i64>,
+    pub retry_after: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct DailyClaimSummary {
     pub total_verified: i64,
-    pub claimed_count: i64,
+    pub fresh_claimed_count: i64,
+    pub already_voted_count: i64,
+    pub total_claimed_count: i64,
     pub not_claimed_count: i64,
-    pub pending_retry_count: i64,
+    pub failed_accounts_count: i64,
     pub pending_otp_count: i64,
+    pub failed_accounts: Vec<FailedAccountDetail>,
 }
 
 #[derive(Debug, Clone)]
@@ -599,7 +612,6 @@ impl AccountService {
         let now = Utc::now();
         let midnight = crate::scheduler::rate_limit::last_midnight_utc(now);
         let midnight_str = midnight.to_rfc3339();
-        let now_str = now.to_rfc3339();
 
         let (total_verified,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM phone_accounts WHERE registration_status = 'VERIFIED'"
@@ -613,42 +625,75 @@ impl AccountService {
         .fetch_one(&self.pool)
         .await?;
 
-        let (claimed_count,): (i64,) = sqlx::query_as(
+        let (fresh_claimed_count,): (i64,) = sqlx::query_as(
             "SELECT COUNT(DISTINCT phone_account_id) FROM scraping_history
-             WHERE scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
+             WHERE response_status = 201
                AND datetime(COALESCE(scraping_completed_at, scraping_started_at)) >= datetime(?)"
         )
         .bind(&midnight_str)
         .fetch_one(&self.pool)
         .await?;
 
-        let (pending_retry_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(DISTINCT phone_account_id) FROM scraping_history h
+        let (already_voted_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT phone_account_id) FROM scraping_history
+             WHERE (scraping_status = 'ALREADY_VOTED' OR (response_status = 409 AND scraping_status != 'FAILED'))
+               AND datetime(COALESCE(scraping_completed_at, scraping_started_at)) >= datetime(?)"
+        )
+        .bind(&midnight_str)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let total_claimed_count = fresh_claimed_count + already_voted_count;
+
+        let failed_rows = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>, Option<i64>, Option<String>)>(
+            "SELECT h.phone_account_id, p.phone_number, p.label, h.error_message, h.response_status, h.retry_after
+             FROM scraping_history h
+             JOIN phone_accounts p ON p.id = h.phone_account_id
              WHERE h.scraping_status = 'FAILED'
-               AND h.retry_after IS NOT NULL
-               AND datetime(h.retry_after) > datetime(?)
                AND datetime(COALESCE(h.scraping_completed_at, h.scraping_started_at)) >= datetime(?)
                AND NOT EXISTS (
                    SELECT 1 FROM scraping_history h2
                    WHERE h2.phone_account_id = h.phone_account_id
                      AND h2.scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
                      AND datetime(COALESCE(h2.scraping_completed_at, h2.scraping_started_at)) >= datetime(?)
-               )"
+               )
+             GROUP BY h.phone_account_id
+             ORDER BY h.id DESC"
         )
-        .bind(&now_str)
         .bind(&midnight_str)
         .bind(&midnight_str)
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
 
-        let not_claimed_count = (total_verified - claimed_count - pending_retry_count).max(0);
+        let failed_accounts: Vec<FailedAccountDetail> = failed_rows
+            .into_iter()
+            .map(|(account_id, phone_number, label, error_msg, response_status, retry_str)| {
+                let retry_after = retry_str
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|d| d.with_timezone(&Utc));
+                FailedAccountDetail {
+                    account_id,
+                    phone_number,
+                    label,
+                    error_message: error_msg.unwrap_or_else(|| "Unknown error".to_string()),
+                    response_status,
+                    retry_after,
+                }
+            })
+            .collect();
+
+        let failed_accounts_count = failed_accounts.len() as i64;
+        let not_claimed_count = (total_verified - total_claimed_count - failed_accounts_count).max(0);
 
         Ok(DailyClaimSummary {
             total_verified,
-            claimed_count,
+            fresh_claimed_count,
+            already_voted_count,
+            total_claimed_count,
             not_claimed_count,
-            pending_retry_count,
+            failed_accounts_count,
             pending_otp_count,
+            failed_accounts,
         })
     }
 
