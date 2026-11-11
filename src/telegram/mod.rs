@@ -404,7 +404,12 @@ async fn handle_command(
 
                 let total_verified = summary.total_verified;
                 let claimed_pct = if total_verified > 0 {
-                    (summary.total_claimed_count as f64 / total_verified as f64) * 100.0
+                    (summary.claimed_count as f64 / total_verified as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let error_pct = if total_verified > 0 {
+                    (summary.total_error_count as f64 / total_verified as f64) * 100.0
                 } else {
                     0.0
                 };
@@ -418,66 +423,65 @@ async fn handle_command(
                     "⚡ <b>Daily Claim Status</b>\n\n\
                     👥 <b>Total Verified Accounts:</b> {}\n\
                     ✅ <b>Successfully Claimed:</b> {} ({:.1}%)\n\
-                       • 🎁 <b>Fresh Votes (+5 pts):</b> {}\n\
-                       • 🔄 <b>Already Voted Today:</b> {}\n\
+                    ❌ <b>Error:</b> {} ({:.1}%)\n\
                     ⏳ <b>Not Claimed:</b> {} ({:.1}%)\n",
                     total_verified,
-                    summary.total_claimed_count,
+                    summary.claimed_count,
                     claimed_pct,
-                    summary.fresh_claimed_count,
-                    summary.already_voted_count,
+                    summary.total_error_count,
+                    error_pct,
                     summary.not_claimed_count,
                     not_claimed_pct
                 );
 
-                if summary.failed_accounts_count > 0 {
-                    let failed_pct = if total_verified > 0 {
-                        (summary.failed_accounts_count as f64 / total_verified as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    response.push_str(&format!(
-                        "\n❌ <b>Errors (1-Hr Retry):</b> {} ({:.1}%)\n",
-                        summary.failed_accounts_count, failed_pct
-                    ));
-
-                    // Breakdown by category
-                    let mut cat_counts = std::collections::HashMap::new();
-                    for acc in &summary.failed_accounts {
-                        let cat = simplify_error_category(&acc.error_message);
-                        *cat_counts.entry(cat).or_insert(0usize) += 1;
-                    }
-                    let mut sorted_cats: Vec<_> = cat_counts.into_iter().collect();
-                    sorted_cats.sort_by(|a, b| b.1.cmp(&a.1));
-                    for (cat, count) in sorted_cats {
-                        response.push_str(&format!("   • {}: {}\n", cat, count));
+                if summary.total_error_count > 0 {
+                    response.push_str("\n<b>Error Breakdown:</b>\n");
+                    if summary.already_voted_count > 0 {
+                        response.push_str(&format!(
+                            "   • Already Voted Today (HTTP 409): {}\n",
+                            summary.already_voted_count
+                        ));
                     }
 
-                    response.push_str("\n<b>Failed accounts (details):</b>\n");
-                    let now = Utc::now();
-                    for acc in summary.failed_accounts.iter().take(5) {
-                        let label = acc.label.as_deref().unwrap_or("Account");
-                        let snippet = format_error_snippet(&acc.error_message);
-                        let retry_str = if let Some(retry_at) = acc.retry_after {
-                            if retry_at > now {
-                                let mins = ((retry_at - now).num_seconds() + 59) / 60;
-                                format!("retry in {}m", mins)
+                    if summary.failed_scrapes_count > 0 {
+                        // Breakdown by category
+                        let mut cat_counts = std::collections::HashMap::new();
+                        for acc in &summary.failed_accounts {
+                            let cat = simplify_error_category(&acc.error_message);
+                            *cat_counts.entry(cat).or_insert(0usize) += 1;
+                        }
+                        let mut sorted_cats: Vec<_> = cat_counts.into_iter().collect();
+                        sorted_cats.sort_by(|a, b| b.1.cmp(&a.1));
+                        for (cat, count) in sorted_cats {
+                            response.push_str(&format!("   • {}: {}\n", cat, count));
+                        }
+
+                        response.push_str("\n<b>Failed accounts (details):</b>\n");
+                        let now = Utc::now();
+                        for acc in summary.failed_accounts.iter().take(5) {
+                            let label = acc.label.as_deref().unwrap_or("Account");
+                            let snippet = format_error_snippet(&acc.error_message);
+                            let retry_str = if let Some(retry_at) = acc.retry_after {
+                                if retry_at > now {
+                                    let mins = ((retry_at - now).num_seconds() + 59) / 60;
+                                    format!("retry in {}m", mins)
+                                } else {
+                                    "ready to retry".to_string()
+                                }
                             } else {
-                                "ready to retry".to_string()
-                            }
-                        } else {
-                            "retry pending".to_string()
-                        };
-                        response.push_str(&format!(
-                            "• {} (#{}) — <code>{}</code>\n   └ <i>{}</i> ({})\n",
-                            label, acc.account_id, acc.phone_number, snippet, retry_str
-                        ));
-                    }
-                    if summary.failed_accounts.len() > 5 {
-                        response.push_str(&format!(
-                            "<i>...and {} more in 1-hr error retry.</i>\n",
-                            summary.failed_accounts.len() - 5
-                        ));
+                                "retry pending".to_string()
+                            };
+                            response.push_str(&format!(
+                                "• {} (#{}) — <code>{}</code>\n   └ <i>{}</i> ({})\n",
+                                label, acc.account_id, acc.phone_number, snippet, retry_str
+                            ));
+                        }
+                        if summary.failed_accounts.len() > 5 {
+                            response.push_str(&format!(
+                                "<i>...and {} more in 1-hr error retry.</i>\n",
+                                summary.failed_accounts.len() - 5
+                            ));
+                        }
                     }
                 }
 

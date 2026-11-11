@@ -57,11 +57,11 @@ pub struct FailedAccountDetail {
 #[derive(Debug, Clone)]
 pub struct DailyClaimSummary {
     pub total_verified: i64,
-    pub fresh_claimed_count: i64,
+    pub claimed_count: i64,
     pub already_voted_count: i64,
-    pub total_claimed_count: i64,
+    pub failed_scrapes_count: i64,
+    pub total_error_count: i64,
     pub not_claimed_count: i64,
-    pub failed_accounts_count: i64,
     pub pending_otp_count: i64,
     pub failed_accounts: Vec<FailedAccountDetail>,
 }
@@ -682,16 +682,18 @@ impl AccountService {
             })
             .collect();
 
-        let failed_accounts_count = failed_accounts.len() as i64;
-        let not_claimed_count = (total_verified - total_claimed_count - failed_accounts_count).max(0);
+        let claimed_count = fresh_claimed_count;
+        let failed_scrapes_count = failed_accounts.len() as i64;
+        let total_error_count = already_voted_count + failed_scrapes_count;
+        let not_claimed_count = (total_verified - claimed_count - total_error_count).max(0);
 
         Ok(DailyClaimSummary {
             total_verified,
-            fresh_claimed_count,
+            claimed_count,
             already_voted_count,
-            total_claimed_count,
+            failed_scrapes_count,
+            total_error_count,
             not_claimed_count,
-            failed_accounts_count,
             pending_otp_count,
             failed_accounts,
         })
