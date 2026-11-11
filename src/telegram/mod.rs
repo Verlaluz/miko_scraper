@@ -60,7 +60,7 @@ pub enum Command {
     Health,
     #[command(description = "Cancel current operation and return to start.")]
     Cancel,
-    #[command(description = "Help and command list.")]
+    #[command(description = "Admin command reference (admins only).")]
     Help,
 }
 
@@ -129,23 +129,61 @@ async fn handle_command(
     admin_telegram_ids: Vec<i64>,
 ) -> HandlerResult {
     match cmd {
-        Command::Start | Command::Help => {
+        Command::Start => {
             dialogue.update(State::Start).await?;
-            let welcome = "👋 <b>Welcome to the CreativeAwards Automated Voter Bot!</b>\n\n\
-                Use this bot to register phone accounts, verify OTPs, and track 12-hour votes for family & friends.\n\n\
-                <b>Commands:</b>\n\
-                /register — Add a phone number & receive OTP\n\
-                /worker — Become a worker and track your accounts\n\
-                /admin — Show worker account counts (admins only)\n\
-                /pay — Show new accounts from the last 12 hours for payment (admins only)\n\
-                /check — Show new and updated worker accounts (admins only)\n\
-                /rep — Show 20-minute operational report (admins only)\n\
-                /claim — Show claimed and not claimed counts (admins only)\n\
-                /cancel — Cancel current action\n\
-                /help — Show this help message";
-            bot.send_message(msg.chat.id, welcome)
-                .parse_mode(teloxide::types::ParseMode::Html)
+            if is_admin(&msg, &admin_telegram_ids) {
+                let welcome = "👋 <b>Welcome to the CreativeAwards Automated Voter Bot!</b>\n\n\
+                    <b>Admin Commands:</b>\n\
+                    /claim — Show daily claimed & error counts\n\
+                    /rep — Show 20-minute operational report\n\
+                    /check — Show new and updated worker accounts\n\
+                    /admin — Show worker account counts\n\
+                    /pay — Show new accounts from last 12h for payment\n\
+                    /status — Account status and ranges\n\
+                    /register — Add a phone number & receive OTP\n\
+                    /worker — Become a worker and track your accounts\n\
+                    /cancel — Cancel current action\n\
+                    /help — Show admin help reference";
+                bot.send_message(msg.chat.id, welcome)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await?;
+            } else {
+                let welcome = "👋 <b>Welcome to the CreativeAwards Voter Bot!</b>\n\n\
+                    Paste any Ethiopian phone number (e.g. <code>0912345678</code> or <code>+251912345678</code>) directly to register it!\n\n\
+                    <b>Commands:</b>\n\
+                    /register — Add a phone number & receive OTP\n\
+                    /worker — Become a worker and track your accounts\n\
+                    /cancel — Cancel current action";
+                bot.send_message(msg.chat.id, welcome)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await?;
+            }
+        }
+        Command::Help => {
+            if !is_admin(&msg, &admin_telegram_ids) {
+                bot.send_message(
+                    msg.chat.id,
+                    "⛔ This command is available to administrators only.",
+                )
                 .await?;
+            } else {
+                let help_text = "📖 <b>Administrator Commands:</b>\n\n\
+                    ⚡ /claim — Show daily claim status (claimed, errors, waiting)\n\
+                    📊 /rep — Show 20-minute operational activity report\n\
+                    🔄 /check — Show new and updated worker accounts\n\
+                    👷 /admin — Show worker account counts and performance\n\
+                    💰 /pay — Show accounts registered in the last 12 hours for payout\n\
+                    📱 /status — Real-time account status and cooldown browser\n\
+                    🟢 /eligible — Accounts eligible to vote now\n\
+                    ⏳ /cooldown — Accounts currently in cooldown\n\
+                    🏥 /health — Bot and database health diagnostic\n\
+                    ➕ /register — Manual phone registration with OTP\n\
+                    🤝 /worker — Become a worker / view assigned accounts\n\
+                    ❌ /cancel — Cancel current interactive action";
+                bot.send_message(msg.chat.id, help_text)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await?;
+            }
         }
         Command::Status if !is_admin(&msg, &admin_telegram_ids) => {
             bot.send_message(msg.chat.id, "⛔ The /status command is available to administrators only.")
