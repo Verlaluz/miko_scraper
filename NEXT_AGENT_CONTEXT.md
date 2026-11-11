@@ -21,7 +21,9 @@
   - If pending retries exist, the scheduler waits for their 1-hour window to mature, claims them, and only sleeps until tomorrow's 02:00 UTC once all eligible accounts are claimed.
 - **Single Timer Rule on Success**: After a confirmed claim or already-voted outcome, `next_eligible_at` is set to tomorrow's `02:00 UTC`.
 - All date/time calculations and storage use UTC (`DateTime<Utc>`).
-- Admin commands `/rep`, `/pay`, `/check`, `/admin`, and `/claim` are live in Telegram.
+- Admin commands `/rep`, `/pay`, `/check`, `/admin`, `/claim`, and `/help` are live in Telegram (strictly restricted to administrators via `is_admin`).
+- Non-admin `/start` only exposes public worker commands (`/register`, `/worker`, `/cancel`).
+- Registration confirmation message is streamlined (removed 24/7/12-hour automated phrasing; removed chat probe notification).
 
 ## Validation Commands
 
