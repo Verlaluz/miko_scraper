@@ -75,9 +75,6 @@ impl ScrapingService {
     /// An account is eligible when it has never acted, or when its last
     /// successful completion occurred before today's 00:00 UTC boundary.
     pub async fn get_cooldown_status(&self, phone_account_id: i64) -> Result<ScrapeCooldownInfo, AppError> {
-        // Prefer the explicit per-account next_eligible_at that was stored after the
-        // last completed job (set by Rule A or Rule B). Fall back to deriving it from
-        // scraping_completed_at when the column is not yet populated (e.g., old rows).
         let last_record: Option<(Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT scraping_completed_at, next_eligible_at
              FROM scraping_history
@@ -89,39 +86,40 @@ impl ScrapingService {
         .await?;
 
         let now = Utc::now();
+        let last_midnight = crate::scheduler::rate_limit::last_midnight_utc(now);
 
-        // If a stored next_eligible_at exists, use it directly for eligibility.
-        if let Some((_, Some(next_str))) = &last_record {
-            if let Ok(next) = DateTime::parse_from_rfc3339(next_str).map(|d| d.with_timezone(&Utc)) {
-                let last_time = last_record
-                    .as_ref()
-                    .and_then(|(ts, _)| ts.as_deref())
-                    .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-                    .map(|d| d.with_timezone(&Utc));
-
-                let is_eligible = now >= next;
-                let remaining = if is_eligible { 0 } else { (next - now).num_seconds().max(0) };
-                let mut cooldown = ScrapeCooldownInfo {
-                    phone_account_id,
-                    is_eligible,
-                    last_scraping_at: last_time,
-                    next_eligible_at: Some(next),
-                    remaining_seconds: remaining,
-                };
-
-                // Still honour transient retry_after overrides.
-                self.apply_retry_after_override(&mut cooldown, now).await?;
-                return Ok(cooldown);
-            }
-        }
-
-        // Fallback: derive eligibility from scraping_completed_at via day-boundary rules.
         let last_time: Option<DateTime<Utc>> = last_record
-            .and_then(|(ts, _)| ts)
-            .and_then(|ts| DateTime::parse_from_rfc3339(&ts).ok())
+            .as_ref()
+            .and_then(|(ts, _)| ts.as_deref())
+            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
             .map(|d| d.with_timezone(&Utc));
 
-        let mut cooldown = calculate_cooldown(phone_account_id, last_time, now);
+        // If the account has never acted, or its last successful completion
+        // was before today's 00:00 UTC boundary, the target website's daily
+        // quota has reset for today. The account is eligible.
+        let mut cooldown = if last_time.map(|t| t < last_midnight).unwrap_or(true) {
+            ScrapeCooldownInfo {
+                phone_account_id,
+                is_eligible: true,
+                last_scraping_at: last_time,
+                next_eligible_at: None,
+                remaining_seconds: 0,
+            }
+        } else {
+            // Already acted since today's 00:00 UTC reset.
+            // Next eligible run is at tomorrow's 02:00 UTC.
+            let next = crate::scheduler::rate_limit::next_daily_run_utc(now);
+            let remaining = (next - now).num_seconds().max(0);
+            ScrapeCooldownInfo {
+                phone_account_id,
+                is_eligible: false,
+                last_scraping_at: last_time,
+                next_eligible_at: Some(next),
+                remaining_seconds: remaining,
+            }
+        };
+
+        // Still honour transient retry_after overrides (e.g. 1-hour backoff on network/API failure).
         self.apply_retry_after_override(&mut cooldown, now).await?;
         Ok(cooldown)
     }
