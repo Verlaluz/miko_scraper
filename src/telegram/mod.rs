@@ -1350,7 +1350,7 @@ async fn handle_otp_code(
                 msg.chat.id,
                 format!(
                     "✅ <b>Phone Verified & Saved!</b>\n\n\
-                    Account <code>{}</code> is active, encrypted at rest, and enrolled in the 24/7 automated 12-hour vote schedule.\n\n\
+                    Account <code>{}</code> is active.\n\n\
                     ⚡ <b>Ready for next:</b> Paste another phone number directly to register it!",
                     account.phone_number
                 ),
@@ -1358,35 +1358,15 @@ async fn handle_otp_code(
             .parse_mode(teloxide::types::ParseMode::Html)
             .await?;
 
-            // Probe the website once with the newly issued token, even if local cooldown is stale.
+            // Probe the website once with the newly issued token in background without sending chat messages
             let scraping_ref = Arc::clone(&scraping_service);
             let account_id = account.id;
-            let bot_for_probe = bot.clone();
-            let chat_id = msg.chat.id;
             tokio::spawn(async move {
-                match scraping_ref
+                if let Err(error) = scraping_ref
                     .start_scraping_after_reauthentication(account_id)
                     .await
                 {
-                    Ok(record) => {
-                        let message = if record.scraping_status
-                            == crate::models::ScrapingStatus::AlreadyVoted
-                        {
-                            "Website response: this account already voted today; no new vote was added."
-                                .to_string()
-                        } else {
-                            format!(
-                                "Website probe completed: {} new vote records reported.",
-                                record.records_scraped
-                            )
-                        };
-                        let _ = bot_for_probe.send_message(chat_id, message).await;
-                    }
-                    Err(error) => {
-                        let _ = bot_for_probe
-                            .send_message(chat_id, format!("Website probe failed: {}", error))
-                            .await;
-                    }
+                    tracing::warn!("Background vote probe failed for account #{}: {}", account_id, error);
                 }
             });
         }
