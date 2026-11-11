@@ -340,6 +340,7 @@ impl ScrapingService {
                     }
                     _ => None,
                 };
+                let retry_at = (completed_at + Duration::hours(1)).to_rfc3339();
                 sqlx::query(
                     "UPDATE scraping_history 
                      SET scraping_completed_at = ?, scraping_status = 'FAILED', error_message = ?,
@@ -349,11 +350,7 @@ impl ScrapingService {
                 )
                 .bind(completed_at.to_rfc3339())
                 .bind(&err_msg)
-                .bind(if Self::is_transient_scrape_error(&err) {
-                    Some((completed_at + Duration::hours(1)).to_rfc3339())
-                } else {
-                    None
-                })
+                .bind(Some(retry_at))
                 .bind(response.as_ref().map(|(status, _)| *status))
                 .bind(response.as_ref().map(|(_, body)| body))
                 .bind(None::<i64>)
@@ -362,7 +359,7 @@ impl ScrapingService {
                 .execute(&self.pool)
                 .await?;
 
-                tracing::error!("Scraping job #{} failed: {}", history_id, err_msg);
+                tracing::error!("Scraping job #{} failed: {}. Retry scheduled in 1 hour.", history_id, err_msg);
 
                 Err(err)
             }

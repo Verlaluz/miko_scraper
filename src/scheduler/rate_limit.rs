@@ -18,6 +18,20 @@ pub const DAILY_RUN_MINUTE: u32 = 0;
 pub const INTER_RECORD_DELAY_MIN_SECS: u64 = 2;
 pub const INTER_RECORD_DELAY_MAX_SECS: u64 = 5;
 
+/// Returns today's 02:00 UTC boundary.
+pub fn today_run_utc(reference: DateTime<Utc>) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(
+        reference.year(),
+        reference.month(),
+        reference.day(),
+        DAILY_RUN_HOUR,
+        DAILY_RUN_MINUTE,
+        0,
+    )
+    .single()
+    .expect("valid date")
+}
+
 /// Returns the next 02:00 UTC boundary strictly after `reference`.
 /// If `reference` is exactly at 02:00 UTC, returns the *following* day's 02:00 UTC.
 pub fn next_daily_run_utc(reference: DateTime<Utc>) -> DateTime<Utc> {

@@ -10,11 +10,16 @@
 
 - The old 12-hour global interval and separate Rule A/Rule B timers have been replaced with a unified daily schedule.
 - State and timers are tracked **strictly per-account** in SQLite.
-- `scraping_history` persists `next_eligible_at` per record.
-- **Shared Daily Run**: Runs once per day at `02:00 UTC` (two hours after the source website resets at `00:00 UTC`).
-- **Single Timer Rule**: After any confirmed outcome (successful claim or already voted since last 00:00 UTC), `next_eligible_at` is set to the next `02:00 UTC`.
-- **Initial Pass & Catch-Up**: On startup, any account whose `next_eligible_at` is in the past is processed immediately.
-- **Inter-record Stagger & Retries**: 2–5 second random delay between records, with up to 3 retries (10s, 20s, 40s) on failure.
+- `scraping_history` persists `next_eligible_at` and `retry_after` per record.
+- **Shared Daily Run**: Runs starting at `02:00 UTC` (two hours after the source website resets at `00:00 UTC`).
+- **Batched Claims (100 accounts / 5 min)**:
+  - Accounts are processed in batches of 100 with a 5-minute gap between batches.
+  - Concurrency within each batch is bounded to 5 simultaneous requests (preventing database pool exhaustion and 429 rate limits).
+- **1-Hour Error Retry**:
+  - If any account fails during voting, its `retry_after` is set to 1 hour in the future.
+  - The scheduler continues running batches until all ready accounts are claimed.
+  - If pending retries exist, the scheduler waits for their 1-hour window to mature, claims them, and only sleeps until tomorrow's 02:00 UTC once all eligible accounts are claimed.
+- **Single Timer Rule on Success**: After a confirmed claim or already-voted outcome, `next_eligible_at` is set to tomorrow's `02:00 UTC`.
 - All date/time calculations and storage use UTC (`DateTime<Utc>`).
 - Admin commands `/rep`, `/pay`, `/check`, `/admin`, and `/claim` are live in Telegram.
 

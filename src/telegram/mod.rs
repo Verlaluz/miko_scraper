@@ -394,39 +394,18 @@ async fn handle_command(
                 )
                 .await?;
             } else {
-                let all_accounts = account_service.list_accounts().await?;
-                if all_accounts.is_empty() {
+                let summary = account_service.get_daily_claim_summary().await?;
+                if summary.total_verified == 0 && summary.pending_otp_count == 0 {
                     bot.send_message(msg.chat.id, "ℹ️ No accounts registered yet.")
                         .await?;
                     return Ok(());
                 }
 
-                let mut verified_accounts = Vec::new();
-                let mut pending_otp_count = 0;
-                for acc in all_accounts {
-                    if acc.registration_status == crate::models::RegistrationStatus::Verified {
-                        verified_accounts.push(acc);
-                    } else {
-                        pending_otp_count += 1;
-                    }
-                }
-
-                let total_verified = verified_accounts.len();
-                let statuses = scraping_service
-                    .get_all_accounts_vote_status(&verified_accounts)
-                    .await?;
-
-                let mut claimed_count = 0;
-                let mut not_claimed_accounts = Vec::new();
-
-                for status in statuses {
-                    if status.is_eligible {
-                        not_claimed_accounts.push(status);
-                    } else {
-                        claimed_count += 1;
-                    }
-                }
-                let not_claimed_count = not_claimed_accounts.len();
+                let total_verified = summary.total_verified;
+                let claimed_count = summary.claimed_count;
+                let not_claimed_count = summary.not_claimed_count;
+                let pending_retry_count = summary.pending_retry_count;
+                let pending_otp_count = summary.pending_otp_count;
 
                 let claimed_pct = if total_verified > 0 {
                     (claimed_count as f64 / total_verified as f64) * 100.0
@@ -451,20 +430,28 @@ async fn handle_command(
                     not_claimed_pct
                 );
 
+                if pending_retry_count > 0 {
+                    response.push_str(&format!(
+                        "🔄 <b>Retrying (1-hr error backoff):</b> {}\n",
+                        pending_retry_count
+                    ));
+                }
+
                 if pending_otp_count > 0 {
                     response.push_str(&format!("📱 <b>Pending OTP Accounts:</b> {}\n", pending_otp_count));
                 }
 
-                if !not_claimed_accounts.is_empty() && not_claimed_accounts.len() <= 10 {
+                let unclaimed_preview = account_service.get_unclaimed_accounts(11).await?;
+                if !unclaimed_preview.is_empty() && unclaimed_preview.len() <= 10 {
                     response.push_str("\n<b>Unclaimed accounts:</b>\n");
-                    for acc in &not_claimed_accounts {
+                    for acc in &unclaimed_preview {
                         let label = acc.label.as_deref().unwrap_or("Account");
                         response.push_str(&format!(
                             "• {} (#{}) — <code>{}</code>\n",
-                            label, acc.account_id, acc.phone_number
+                            label, acc.id, acc.phone_number
                         ));
                     }
-                } else if not_claimed_accounts.len() > 10 {
+                } else if unclaimed_preview.len() > 10 {
                     response.push_str(&format!(
                         "\n<i>Use /eligible to view all {} unclaimed accounts.</i>\n",
                         not_claimed_count
@@ -473,7 +460,7 @@ async fn handle_command(
 
                 response.push_str(&format!(
                     "\n🕒 <b>Daily Reset:</b> 00:00 UTC\n\
-                     ⏰ <b>Daily Run Time:</b> 02:00 UTC"
+                     ⏰ <b>Daily Run:</b> Batches of 100 / 5 min from 02:00 UTC"
                 ));
 
                 bot.send_message(msg.chat.id, response)

@@ -45,6 +45,15 @@ pub struct WorkerClaimStat {
 }
 
 #[derive(Debug, Clone)]
+pub struct DailyClaimSummary {
+    pub total_verified: i64,
+    pub claimed_count: i64,
+    pub not_claimed_count: i64,
+    pub pending_retry_count: i64,
+    pub pending_otp_count: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ActivityReport20m {
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
@@ -506,6 +515,168 @@ impl AccountService {
         .ok_or(AppError::AccountNotFound(id))?;
 
         Ok(account)
+    }
+
+    /// Fetches verified accounts that are ready to claim in the current daily cycle.
+    /// Excludes accounts that have already succeeded or been marked already voted today,
+    /// and accounts currently in a 1-hour error backoff window.
+    pub async fn get_ready_to_claim_accounts(&self, limit: i64) -> Result<Vec<PhoneAccount>, AppError> {
+        let now = Utc::now();
+        let midnight = crate::scheduler::rate_limit::last_midnight_utc(now);
+        let midnight_str = midnight.to_rfc3339();
+        let now_str = now.to_rfc3339();
+
+        let accounts = sqlx::query_as::<_, PhoneAccount>(
+            "SELECT p.id, p.phone_number, p.label, p.registration_status, p.created_at, p.updated_at
+             FROM phone_accounts p
+             WHERE p.registration_status = 'VERIFIED'
+               AND NOT EXISTS (
+                   SELECT 1 FROM scraping_history h
+                   WHERE h.phone_account_id = p.id
+                     AND h.scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
+                     AND datetime(COALESCE(h.scraping_completed_at, h.scraping_started_at)) >= datetime(?)
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM scraping_history h
+                   WHERE h.phone_account_id = p.id
+                     AND h.scraping_status = 'FAILED'
+                     AND h.retry_after IS NOT NULL
+                     AND datetime(h.retry_after) > datetime(?)
+               )
+             ORDER BY p.id DESC
+             LIMIT ?"
+        )
+        .bind(&midnight_str)
+        .bind(&now_str)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(accounts)
+    }
+
+    /// Finds the earliest pending retry timestamp for accounts currently in a 1-hour backoff.
+    pub async fn get_earliest_pending_retry(&self) -> Result<Option<DateTime<Utc>>, AppError> {
+        let now = Utc::now();
+        let midnight = crate::scheduler::rate_limit::last_midnight_utc(now);
+        let midnight_str = midnight.to_rfc3339();
+        let now_str = now.to_rfc3339();
+
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT h.retry_after
+             FROM scraping_history h
+             INNER JOIN phone_accounts p ON p.id = h.phone_account_id
+             WHERE p.registration_status = 'VERIFIED'
+               AND h.scraping_status = 'FAILED'
+               AND h.retry_after IS NOT NULL
+               AND datetime(h.retry_after) > datetime(?)
+               AND datetime(COALESCE(h.scraping_completed_at, h.scraping_started_at)) >= datetime(?)
+               AND NOT EXISTS (
+                   SELECT 1 FROM scraping_history h2
+                   WHERE h2.phone_account_id = p.id
+                     AND h2.scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
+                     AND datetime(COALESCE(h2.scraping_completed_at, h2.scraping_started_at)) >= datetime(?)
+               )
+             ORDER BY datetime(h.retry_after) ASC
+             LIMIT 1"
+        )
+        .bind(&now_str)
+        .bind(&midnight_str)
+        .bind(&midnight_str)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((ts,)) = row {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&ts) {
+                return Ok(Some(dt.with_timezone(&Utc)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Computes the daily claim summary for verified accounts since today's 00:00 UTC.
+    pub async fn get_daily_claim_summary(&self) -> Result<DailyClaimSummary, AppError> {
+        let now = Utc::now();
+        let midnight = crate::scheduler::rate_limit::last_midnight_utc(now);
+        let midnight_str = midnight.to_rfc3339();
+        let now_str = now.to_rfc3339();
+
+        let (total_verified,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM phone_accounts WHERE registration_status = 'VERIFIED'"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let (pending_otp_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM phone_accounts WHERE registration_status != 'VERIFIED'"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let (claimed_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT phone_account_id) FROM scraping_history
+             WHERE scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
+               AND datetime(COALESCE(scraping_completed_at, scraping_started_at)) >= datetime(?)"
+        )
+        .bind(&midnight_str)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let (pending_retry_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT phone_account_id) FROM scraping_history h
+             WHERE h.scraping_status = 'FAILED'
+               AND h.retry_after IS NOT NULL
+               AND datetime(h.retry_after) > datetime(?)
+               AND datetime(COALESCE(h.scraping_completed_at, h.scraping_started_at)) >= datetime(?)
+               AND NOT EXISTS (
+                   SELECT 1 FROM scraping_history h2
+                   WHERE h2.phone_account_id = h.phone_account_id
+                     AND h2.scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
+                     AND datetime(COALESCE(h2.scraping_completed_at, h2.scraping_started_at)) >= datetime(?)
+               )"
+        )
+        .bind(&now_str)
+        .bind(&midnight_str)
+        .bind(&midnight_str)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let not_claimed_count = (total_verified - claimed_count - pending_retry_count).max(0);
+
+        Ok(DailyClaimSummary {
+            total_verified,
+            claimed_count,
+            not_claimed_count,
+            pending_retry_count,
+            pending_otp_count,
+        })
+    }
+
+    /// Fetches up to `limit` unclaimed accounts (ready to claim or in retry) for preview.
+    pub async fn get_unclaimed_accounts(&self, limit: i64) -> Result<Vec<PhoneAccount>, AppError> {
+        let now = Utc::now();
+        let midnight = crate::scheduler::rate_limit::last_midnight_utc(now);
+        let midnight_str = midnight.to_rfc3339();
+
+        let accounts = sqlx::query_as::<_, PhoneAccount>(
+            "SELECT p.id, p.phone_number, p.label, p.registration_status, p.created_at, p.updated_at
+             FROM phone_accounts p
+             WHERE p.registration_status = 'VERIFIED'
+               AND NOT EXISTS (
+                   SELECT 1 FROM scraping_history h
+                   WHERE h.phone_account_id = p.id
+                     AND h.scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
+                     AND datetime(COALESCE(h.scraping_completed_at, h.scraping_started_at)) >= datetime(?)
+               )
+             ORDER BY p.id DESC
+             LIMIT ?"
+        )
+        .bind(&midnight_str)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(accounts)
     }
 
     /// Deletes a phone account along with its associated authentication sessions and scraping history.
