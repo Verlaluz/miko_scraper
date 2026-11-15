@@ -54,6 +54,9 @@ pub enum AppError {
 
     #[error("Internal server error: {0}")]
     Internal(String),
+
+    #[error("Payment error: {0}")]
+    Payment(String),
 }
 
 /// Implement `IntoResponse` for `AppError`.
@@ -98,6 +101,7 @@ impl IntoResponse for AppError {
                 tracing::error!("Internal error: {}", err);
                 (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "An internal error occurred.".to_string())
             }
+            AppError::Payment(err) => (StatusCode::BAD_REQUEST, "PAYMENT_ERROR", err.clone()),
         };
 
         let body = Json(json!({

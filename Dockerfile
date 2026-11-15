@@ -29,7 +29,7 @@ COPY src        ./src
 COPY migrations ./migrations
 COPY frontend   ./frontend
 
-RUN cargo build --release
+RUN touch src/main.rs && cargo build --release
 
 # =============================================================================
 # Stage 2: Runtime image

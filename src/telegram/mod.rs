@@ -1,4 +1,5 @@
 use crate::models::ScrapingRecord;
+use crate::services::account_service::{ApplyResult, WorkerPaymentStats};
 use crate::services::scraping_service::AccountVoteStatus;
 use crate::services::{AccountService, ScrapingService};
 use chrono::Utc;
@@ -7,7 +8,7 @@ use std::sync::Arc;
 use teloxide::{
     dispatching::dialogue::InMemStorage,
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup},
+    types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId},
     utils::command::BotCommands,
 };
 
@@ -22,9 +23,13 @@ pub enum State {
     Start,
     AwaitingPhoneNumber,
     AwaitingWorkerName,
+    AwaitingApplicantName,
     AwaitingAccountSearch,
     AwaitingOtp {
         phone_number: String,
+    },
+    AwaitingCustomPaymentAmount {
+        worker_telegram_id: i64,
     },
 }
 
@@ -36,14 +41,22 @@ pub enum Command {
     Start,
     #[command(description = "Register a new phone number with OTP.")]
     Register,
+    #[command(description = "Apply to become a worker and get bot access.")]
+    Apply,
+    #[command(description = "View pending worker applications (admins only).")]
+    Request,
     #[command(description = "Become a worker and track your registered accounts.")]
     Worker,
     #[command(description = "Register a worker: /adminregister <telegram_id> <name>.")]
     Adminregister(String),
     #[command(description = "Show worker account counts.")]
     Admin,
-    #[command(description = "Show new accounts from the last 12 hours for payment.")]
-    Pay,
+    #[command(description = "Show worker payment tracker (admins only).")]
+    Cash,
+    #[command(description = "Record worker payment: /pay <list number> <amount> (admins only).")]
+    Pay(String),
+    #[command(description = "Worker control center: block or unblock workers (admins only).")]
+    Control(String),
     #[command(description = "Show new and updated worker accounts.")]
     Check,
     #[command(description = "Show 20-minute operational activity report.")]
@@ -92,10 +105,15 @@ pub fn start_telegram_bot(
                         .branch(dptree::case![State::Start].endpoint(handle_start_text))
                         .branch(dptree::case![State::AwaitingPhoneNumber].endpoint(handle_phone_number))
                         .branch(dptree::case![State::AwaitingWorkerName].endpoint(handle_worker_name))
+                        .branch(dptree::case![State::AwaitingApplicantName].endpoint(handle_applicant_name))
                         .branch(dptree::case![State::AwaitingAccountSearch].endpoint(handle_account_search))
                         .branch(
                             dptree::case![State::AwaitingOtp { phone_number }]
                                 .endpoint(handle_otp_code),
+                        )
+                        .branch(
+                            dptree::case![State::AwaitingCustomPaymentAmount { worker_telegram_id }]
+                                .endpoint(handle_custom_payment_amount),
                         ),
                 );
 
@@ -128,17 +146,26 @@ async fn handle_command(
     account_service: Arc<AccountService>,
     admin_telegram_ids: Vec<i64>,
 ) -> HandlerResult {
+    let sender_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+    if !is_admin(&msg, &admin_telegram_ids) && account_service.is_worker_blocked(sender_id).await.unwrap_or(false) {
+        // Option B: Blocked worker ghost mode — completely ignore
+        return Ok(());
+    }
+
     match cmd {
         Command::Start => {
             dialogue.update(State::Start).await?;
             if is_admin(&msg, &admin_telegram_ids) {
                 let welcome = "👋 <b>Welcome to the CreativeAwards Automated Voter Bot!</b>\n\n\
                     <b>Admin Commands:</b>\n\
+                    /request — View & accept/reject worker applications\n\
                     /claim — Show daily claimed & error counts\n\
+                    /cash — Worker payment tracker (cooldowns & payments)\n\
+                    /pay <num> <amt> — Record payment shortcut (e.g. /pay 1 20)\n\
+                    /control — Worker control center (block / unblock workers)\n\
                     /rep — Show 20-minute operational report\n\
                     /check — Show new and updated worker accounts\n\
                     /admin — Show worker account counts\n\
-                    /pay — Show new accounts from last 12h for payment\n\
                     /status — Account status and ranges\n\
                     /register — Add a phone number & receive OTP\n\
                     /worker — Become a worker and track your accounts\n\
@@ -151,6 +178,7 @@ async fn handle_command(
                 let welcome = "👋 <b>Welcome to the CreativeAwards Voter Bot!</b>\n\n\
                     Paste any Ethiopian phone number (e.g. <code>0912345678</code> or <code>+251912345678</code>) directly to register it!\n\n\
                     <b>Commands:</b>\n\
+                    /apply — Apply to become a worker and get bot access\n\
                     /register — Add a phone number & receive OTP\n\
                     /worker — Become a worker and track your accounts\n\
                     /cancel — Cancel current action";
@@ -168,11 +196,14 @@ async fn handle_command(
                 .await?;
             } else {
                 let help_text = "📖 <b>Administrator Commands:</b>\n\n\
+                    📋 /request — Review & accept/reject worker applications\n\
                     ⚡ /claim — Show daily claim status (claimed, errors, waiting)\n\
+                    💰 /cash — Worker payment tracker (view cooldowns, paid, remaining)\n\
+                    💵 /pay <num> <amt> — Quick payment shortcut (e.g. /pay 1 20)\n\
+                    🛡️ /control — Worker control center: block or unblock workers\n\
                     📊 /rep — Show 20-minute operational activity report\n\
                     🔄 /check — Show new and updated worker accounts\n\
                     👷 /admin — Show worker account counts and performance\n\
-                    💰 /pay — Show accounts registered in the last 12 hours for payout\n\
                     📱 /status — Real-time account status and cooldown browser\n\
                     🟢 /eligible — Accounts eligible to vote now\n\
                     ⏳ /cooldown — Accounts currently in cooldown\n\
@@ -208,6 +239,42 @@ async fn handle_command(
             )
             .parse_mode(teloxide::types::ParseMode::Html)
             .await?;
+        }
+        Command::Apply => {
+            let sender_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+            if let Ok(Some((name, status, is_blocked))) = account_service.get_worker_status_details(sender_id).await {
+                if status == "APPROVED" && !is_blocked {
+                    bot.send_message(
+                        msg.chat.id,
+                        format!("ℹ️ You are already registered and active as worker <b>{}</b>.", name),
+                    )
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await?;
+                    return Ok(());
+                } else if status == "PENDING" {
+                    bot.send_message(
+                        msg.chat.id,
+                        "⏳ Your application is already submitted and pending review. Please wait for an administrator to accept or reject your request.",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            dialogue.update(State::AwaitingApplicantName).await?;
+            bot.send_message(
+                msg.chat.id,
+                "👷 <b>Worker Application</b>\n\nPlease enter your full name to apply:",
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+        }
+        Command::Request => {
+            if !is_admin(&msg, &admin_telegram_ids) {
+                bot.send_message(msg.chat.id, "⛔ You are not authorized to view worker requests.")
+                    .await?;
+            } else {
+                send_pending_requests(&bot, msg.chat.id, &account_service, None).await?;
+            }
         }
         Command::Worker => {
             dialogue.update(State::AwaitingWorkerName).await?;
@@ -259,10 +326,14 @@ async fn handle_command(
                         .iter()
                         .enumerate()
                         .map(|(index, worker)| {
+                            let status_badge = if worker.is_blocked { "❌ " } else { "" };
+                            let blocked_suffix = if worker.is_blocked { " [BLOCKED]" } else { "" };
                             format!(
-                                "{}. <b>{}</b> — {} account(s), {} cooldown (<code>{}</code>)",
+                                "{}. {}<b>{}{}</b> — {} account(s), {} cooldown (<code>{}</code>)",
                                 index + 1,
+                                status_badge,
                                 worker.display_name,
+                                blocked_suffix,
                                 worker.account_count,
                                 worker.cooldown_count,
                                 worker.telegram_id
@@ -283,59 +354,28 @@ async fn handle_command(
                     .await?;
             }
         }
-        Command::Pay => {
+        Command::Cash => {
             if !is_admin(&msg, &admin_telegram_ids) {
-                bot.send_message(msg.chat.id, "⛔ You are not authorized to view payment statistics.")
+                bot.send_message(msg.chat.id, "⛔ You are not authorized to view the payment tracker.")
                     .await?;
             } else {
-                let workers = account_service.payment_statistics().await?;
-                let report = if workers.is_empty() {
-                    "No new accounts registered in the last 12 hours.".to_string()
-                } else {
-                    let rows = workers
-                        .iter()
-                        .enumerate()
-                        .map(|(index, worker)| {
-                            format!(
-                                "{}. <b>{}</b> — {} account(s), {} cooldown\n(<code>{}</code>)",
-                                index + 1,
-                                worker.display_name,
-                                worker.account_count,
-                                worker.cooldown_count,
-                                worker.telegram_id
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    format!(
-                        "💰 <b>Worker payment accounts (new registrations in the last 12 hours)</b>\n\n{}",
-                        rows
-                    )
-                };
-                if report.len() <= 3800 {
-                    bot.send_message(msg.chat.id, report)
-                        .parse_mode(teloxide::types::ParseMode::Html)
-                        .await?;
-                } else {
-                    let mut chunk = String::new();
-                    for line in report.lines() {
-                        if chunk.len() + line.len() + 1 > 3800 {
-                            bot.send_message(msg.chat.id, &chunk)
-                                .parse_mode(teloxide::types::ParseMode::Html)
-                                .await?;
-                            chunk.clear();
-                        }
-                        if !chunk.is_empty() {
-                            chunk.push('\n');
-                        }
-                        chunk.push_str(line);
-                    }
-                    if !chunk.is_empty() {
-                        bot.send_message(msg.chat.id, chunk)
-                            .parse_mode(teloxide::types::ParseMode::Html)
-                            .await?;
-                    }
-                }
+                send_cash_tracker(&bot, msg.chat.id, &account_service, 0, None).await?;
+            }
+        }
+        Command::Pay(args) => {
+            if !is_admin(&msg, &admin_telegram_ids) {
+                bot.send_message(msg.chat.id, "⛔ You are not authorized to record worker payments.")
+                    .await?;
+            } else {
+                handle_pay_command(&bot, msg.chat.id, &args, &account_service).await?;
+            }
+        }
+        Command::Control(args) => {
+            if !is_admin(&msg, &admin_telegram_ids) {
+                bot.send_message(msg.chat.id, "⛔ You are not authorized to access worker controls.")
+                    .await?;
+            } else {
+                handle_control_command(&bot, msg.chat.id, &args, &account_service).await?;
             }
         }
         Command::Check => {
@@ -631,6 +671,11 @@ async fn handle_worker_name(
     msg: Message,
     account_service: Arc<AccountService>,
 ) -> HandlerResult {
+    let sender_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+    if account_service.is_worker_blocked(sender_id).await.unwrap_or(false) {
+        return Ok(());
+    }
+
     let Some(name) = msg.text().map(str::trim).filter(|name| !name.is_empty()) else {
         bot.send_message(msg.chat.id, "Please enter a valid name, or use /cancel.")
             .await?;
@@ -805,7 +850,149 @@ async fn handle_status_filter(
     scraping_service: Arc<ScrapingService>,
     admin_telegram_ids: Vec<i64>,
 ) -> HandlerResult {
+    let sender_id = query.from.id.0 as i64;
+    if !admin_telegram_ids.contains(&sender_id) && account_service.is_worker_blocked(sender_id).await.unwrap_or(false) {
+        return Ok(());
+    }
+
     if let Some(data) = query.data.clone() {
+        if data.starts_with("ctrl_") {
+            if !is_admin_callback(&query, &admin_telegram_ids) {
+                bot.answer_callback_query(query.id)
+                    .text("Admins only.")
+                    .show_alert(true)
+                    .await?;
+                return Ok(());
+            }
+
+            let chat_id = match query.message.as_ref() {
+                Some(m) => m.chat().id,
+                None => return Ok(()),
+            };
+            let msg_id = query.message.as_ref().map(|m| m.id());
+
+            if let Some(page_str) = data.strip_prefix("ctrl_p:") {
+                let page: usize = page_str.parse().unwrap_or(0);
+                bot.answer_callback_query(query.id).await?;
+                return send_control_center(&bot, chat_id, &account_service, page, msg_id).await;
+            } else if let Some(id_str) = data.strip_prefix("ctrl_toggle:") {
+                let parts: Vec<&str> = id_str.split(':').collect();
+                if let Ok(worker_id) = parts[0].parse::<i64>() {
+                    let page: usize = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+                    match account_service.toggle_worker_blocked_status(worker_id).await {
+                        Ok(Some((name, is_blocked))) => {
+                            let text = if is_blocked {
+                                format!("❌ Worker {} is now BLOCKED.", name)
+                            } else {
+                                format!("✅ Worker {} is now UNBLOCKED.", name)
+                            };
+                            let _ = bot.answer_callback_query(query.id).text(text).await;
+                            return send_control_center(&bot, chat_id, &account_service, page, msg_id).await;
+                        }
+                        _ => {
+                            let _ = bot.answer_callback_query(query.id).text("Worker not found.").show_alert(true).await;
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if data.starts_with("req_") {
+            if !is_admin_callback(&query, &admin_telegram_ids) {
+                bot.answer_callback_query(query.id)
+                    .text("Admins only.")
+                    .show_alert(true)
+                    .await?;
+                return Ok(());
+            }
+
+            let chat_id = match query.message.as_ref() {
+                Some(m) => m.chat().id,
+                None => return Ok(()),
+            };
+            let msg_id = query.message.as_ref().map(|m| m.id());
+
+            if let Some(id_str) = data.strip_prefix("req_accept:") {
+                if let Ok(worker_id) = id_str.parse::<i64>() {
+                    if let Ok(Some(name)) = account_service.approve_worker_application(worker_id).await {
+                        let text = format!("✅ Accepted {}! Worker is now active.", name);
+                        let _ = bot.answer_callback_query(query.id).text(text).await;
+                        let _ = bot.send_message(
+                            ChatId(worker_id),
+                            format!(
+                                "🎉 <b>Congratulations, {}!</b>\n\n\
+                                Your worker application has been <b>accepted</b>!\n\
+                                You can now send /start and paste phone numbers to register them.",
+                                name
+                            ),
+                        )
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .await;
+                        return send_pending_requests(&bot, chat_id, &account_service, msg_id).await;
+                    }
+                }
+            } else if let Some(id_str) = data.strip_prefix("req_reject:") {
+                if let Ok(worker_id) = id_str.parse::<i64>() {
+                    if let Ok(Some(name)) = account_service.reject_worker_application(worker_id).await {
+                        let text = format!("🚫 Rejected {}! Worker access denied.", name);
+                        let _ = bot.answer_callback_query(query.id).text(text).await;
+                        let _ = bot.send_message(
+                            ChatId(worker_id),
+                            "❌ <b>Application Update:</b>\n\nYour application to become a worker was not approved at this time.",
+                        )
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .await;
+                        return send_pending_requests(&bot, chat_id, &account_service, msg_id).await;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if data.starts_with("cash_") {
+            if !is_admin_callback(&query, &admin_telegram_ids) {
+                bot.answer_callback_query(query.id)
+                    .text("Admins only.")
+                    .show_alert(true)
+                    .await?;
+                return Ok(());
+            }
+            bot.answer_callback_query(query.id).await?;
+
+            let chat_id = match query.message.as_ref() {
+                Some(m) => m.chat().id,
+                None => return Ok(()),
+            };
+            let msg_id = query.message.as_ref().map(|m| m.id());
+
+            if data == "cash_back" {
+                return send_cash_tracker(&bot, chat_id, &account_service, 0, msg_id).await;
+            } else if let Some(page_str) = data.strip_prefix("cash_p:") {
+                let page: usize = page_str.parse().unwrap_or(0);
+                return handle_cash_page_switch(&bot, chat_id, msg_id, page, &account_service).await;
+            } else if let Some(id_str) = data.strip_prefix("cash_w:") {
+                if let Ok(worker_id) = id_str.parse::<i64>() {
+                    return handle_cash_worker_selection(&bot, chat_id, msg_id, worker_id, &account_service).await;
+                }
+            } else if let Some(rest) = data.strip_prefix("cash_pay:") {
+                let parts: Vec<&str> = rest.split(':').collect();
+                if parts.len() == 2 {
+                    if let Ok(worker_id) = parts[0].parse::<i64>() {
+                        return handle_cash_pay_quick(&bot, chat_id, msg_id, worker_id, parts[1], &account_service).await;
+                    }
+                }
+            } else if let Some(id_str) = data.strip_prefix("cash_other:") {
+                if let Ok(worker_id) = id_str.parse::<i64>() {
+                    return handle_cash_other_prompt(&bot, chat_id, dialogue, worker_id, &account_service).await;
+                }
+            } else if let Some(id_str) = data.strip_prefix("cash_undo:") {
+                if let Ok(worker_id) = id_str.parse::<i64>() {
+                    return handle_cash_undo(&bot, chat_id, msg_id, worker_id, &account_service).await;
+                }
+            }
+            return Ok(());
+        }
         if data == "admin:check_new" || data == "admin:check_updated" {
             if !is_admin_callback(&query, &admin_telegram_ids) {
                 bot.answer_callback_query(query.id)
@@ -1263,6 +1450,22 @@ async fn handle_start_text(
     msg: Message,
     account_service: Arc<AccountService>,
 ) -> HandlerResult {
+    let sender_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+    if let Ok(Some((_name, status, _))) = account_service.get_worker_status_details(sender_id).await {
+        if status == "PENDING" {
+            bot.send_message(
+                msg.chat.id,
+                "⏳ <b>Application Pending</b>\n\nYour worker application is currently pending review. Please wait until an administrator accepts your request before adding accounts.",
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+            return Ok(());
+        }
+    }
+    if account_service.is_worker_blocked(sender_id).await.unwrap_or(false) {
+        return Ok(());
+    }
+
     if let Some(text) = msg.text() {
         let trimmed = text.trim();
         // Check if input is a valid Ethiopian phone number
@@ -1287,6 +1490,22 @@ async fn handle_phone_number(
     msg: Message,
     account_service: Arc<AccountService>,
 ) -> HandlerResult {
+    let sender_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+    if let Ok(Some((_name, status, _))) = account_service.get_worker_status_details(sender_id).await {
+        if status == "PENDING" {
+            bot.send_message(
+                msg.chat.id,
+                "⏳ <b>Application Pending</b>\n\nYour worker application is currently pending review. Please wait until an administrator accepts your request before adding accounts.",
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+            return Ok(());
+        }
+    }
+    if account_service.is_worker_blocked(sender_id).await.unwrap_or(false) {
+        return Ok(());
+    }
+
     let raw_text = match msg.text() {
         Some(t) => t.trim(),
         None => {
@@ -1355,6 +1574,11 @@ async fn handle_otp_code(
     account_service: Arc<AccountService>,
     scraping_service: Arc<ScrapingService>,
 ) -> HandlerResult {
+    let sender_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+    if account_service.is_worker_blocked(sender_id).await.unwrap_or(false) {
+        return Ok(());
+    }
+
     let otp_code = match msg.text() {
         Some(t) => t.trim(),
         None => {
@@ -1458,4 +1682,1052 @@ fn format_error_snippet(err: &str) -> String {
             clean
         }
     }
+}
+
+fn build_cash_keyboard(workers: &[WorkerPaymentStats], page: usize) -> InlineKeyboardMarkup {
+    const PAGE_SIZE: usize = 20;
+    let total_pages = (workers.len() + PAGE_SIZE - 1).max(1) / PAGE_SIZE.max(1);
+    let total_pages = if total_pages == 0 { 1 } else { total_pages };
+    let current_page = page.min(total_pages.saturating_sub(1));
+    let start_idx = current_page * PAGE_SIZE;
+    let end_idx = (start_idx + PAGE_SIZE).min(workers.len());
+
+    let page_workers = &workers[start_idx..end_idx];
+    let mut keyboard_rows = Vec::new();
+
+    for chunk in page_workers.chunks(2) {
+        let mut row = Vec::new();
+        for w in chunk {
+            let list_num = workers
+                .iter()
+                .position(|x| x.telegram_id == w.telegram_id)
+                .unwrap_or(0)
+                + 1;
+            let badge = if w.is_blocked { "❌ " } else { "" };
+            let btn_text = format!("{}{}. {} ({})", badge, list_num, w.display_name, w.remaining_cooldown);
+            row.push(InlineKeyboardButton::callback(
+                btn_text,
+                format!("cash_w:{}", w.telegram_id),
+            ));
+        }
+        keyboard_rows.push(row);
+    }
+
+    if total_pages > 1 {
+        let mut nav_row = Vec::new();
+        if current_page > 0 {
+            nav_row.push(InlineKeyboardButton::callback(
+                "◀️ Prev",
+                format!("cash_p:{}", current_page - 1),
+            ));
+        }
+        nav_row.push(InlineKeyboardButton::callback(
+            format!("Page {}/{}", current_page + 1, total_pages),
+            format!("cash_p:{}", current_page),
+        ));
+        if current_page + 1 < total_pages {
+            nav_row.push(InlineKeyboardButton::callback(
+                "Next ▶️",
+                format!("cash_p:{}", current_page + 1),
+            ));
+        }
+        keyboard_rows.push(nav_row);
+    }
+
+    InlineKeyboardMarkup::new(keyboard_rows)
+}
+
+async fn send_cash_tracker(
+    bot: &Bot,
+    chat_id: ChatId,
+    account_service: &Arc<AccountService>,
+    page: usize,
+    edit_message_id: Option<MessageId>,
+) -> HandlerResult {
+    let workers = account_service.worker_payment_statistics().await?;
+    if workers.is_empty() {
+        if let Some(msg_id) = edit_message_id {
+            bot.edit_message_text(chat_id, msg_id, "ℹ️ No workers are registered yet.")
+                .await?;
+        } else {
+            bot.send_message(chat_id, "ℹ️ No workers are registered yet.")
+                .await?;
+        }
+        return Ok(());
+    }
+
+    let total_cooldown: i64 = workers.iter().map(|w| w.cooldown_count).sum();
+    let total_paid: i64 = workers.iter().map(|w| w.paid_cooldown).sum();
+    let total_remaining: i64 = workers.iter().map(|w| w.remaining_cooldown).sum();
+
+    let mut report = String::from("💰 <b>Worker Payment Tracker</b>\n\n");
+    for (idx, worker) in workers.iter().enumerate() {
+        let status_badge = if worker.is_blocked { "❌ " } else { "" };
+        let blocked_suffix = if worker.is_blocked { " [BLOCKED]" } else { "" };
+        report.push_str(&format!(
+            "{}. {}{}{} - Cooldown: {} | Paid: {} | Remaining: {}\n",
+            idx + 1,
+            status_badge,
+            worker.display_name,
+            blocked_suffix,
+            worker.cooldown_count,
+            worker.paid_cooldown,
+            worker.remaining_cooldown
+        ));
+    }
+    report.push_str(&format!(
+        "\n<b>Grand Total:</b>\n• Total Cooldown: {}\n• Total Paid: {}\n• Total Remaining: {}",
+        total_cooldown, total_paid, total_remaining
+    ));
+
+    let keyboard = build_cash_keyboard(&workers, page);
+
+    if let Some(msg_id) = edit_message_id {
+        if report.len() <= 3800 {
+            bot.edit_message_text(chat_id, msg_id, report)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(keyboard)
+                .await?;
+            return Ok(());
+        } else {
+            let _ = bot.delete_message(chat_id, msg_id).await;
+        }
+    }
+
+    if report.len() <= 3800 {
+        bot.send_message(chat_id, report)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .reply_markup(keyboard)
+            .await?;
+    } else {
+        let mut chunks = Vec::new();
+        let mut current_chunk = String::new();
+        for line in report.lines() {
+            if current_chunk.len() + line.len() + 1 > 3800 {
+                chunks.push(current_chunk);
+                current_chunk = String::new();
+            }
+            if !current_chunk.is_empty() {
+                current_chunk.push('\n');
+            }
+            current_chunk.push_str(line);
+        }
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+
+        let num_chunks = chunks.len();
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let mut msg_builder = bot
+                .send_message(chat_id, chunk)
+                .parse_mode(teloxide::types::ParseMode::Html);
+            if i == num_chunks - 1 {
+                msg_builder = msg_builder.reply_markup(keyboard.clone());
+            }
+            msg_builder.await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_cash_page_switch(
+    bot: &Bot,
+    chat_id: ChatId,
+    msg_id: Option<MessageId>,
+    page: usize,
+    account_service: &Arc<AccountService>,
+) -> HandlerResult {
+    let workers = account_service.worker_payment_statistics().await?;
+    let keyboard = build_cash_keyboard(&workers, page);
+    if let Some(msg_id) = msg_id {
+        let _ = bot
+            .edit_message_reply_markup(chat_id, msg_id)
+            .reply_markup(keyboard)
+            .await;
+    }
+    Ok(())
+}
+
+async fn handle_cash_worker_selection(
+    bot: &Bot,
+    chat_id: ChatId,
+    msg_id: Option<MessageId>,
+    telegram_id: i64,
+    account_service: &Arc<AccountService>,
+) -> HandlerResult {
+    let worker = match account_service.get_worker_payment_stats_by_id(telegram_id).await? {
+        Some(w) => w,
+        None => {
+            bot.send_message(chat_id, "⚠️ Worker not found.").await?;
+            return Ok(());
+        }
+    };
+
+    let text = format!(
+        "💵 <b>Pay Worker: {}</b>\n\n\
+        • Cooldown: {}\n\
+        • Paid: {}\n\
+        • <b>Remaining: {}</b>\n\n\
+        Select payment amount (in cooldowns):",
+        worker.display_name,
+        worker.cooldown_count,
+        worker.paid_cooldown,
+        worker.remaining_cooldown
+    );
+
+    let keyboard = InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("10", format!("cash_pay:{}:10", telegram_id)),
+            InlineKeyboardButton::callback("20", format!("cash_pay:{}:20", telegram_id)),
+            InlineKeyboardButton::callback("50", format!("cash_pay:{}:50", telegram_id)),
+        ],
+        vec![InlineKeyboardButton::callback(
+            format!("Pay all remaining ({})", worker.remaining_cooldown),
+            format!("cash_pay:{}:all", telegram_id),
+        )],
+        vec![
+            InlineKeyboardButton::callback("Other", format!("cash_other:{}", telegram_id)),
+            InlineKeyboardButton::callback("« Back to /cash", "cash_back".to_string()),
+        ],
+    ]);
+
+    if let Some(msg_id) = msg_id {
+        bot.edit_message_text(chat_id, msg_id, text)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .reply_markup(keyboard)
+            .await?;
+    } else {
+        bot.send_message(chat_id, text)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .reply_markup(keyboard)
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_cash_pay_quick(
+    bot: &Bot,
+    chat_id: ChatId,
+    msg_id: Option<MessageId>,
+    telegram_id: i64,
+    amount_str: &str,
+    account_service: &Arc<AccountService>,
+) -> HandlerResult {
+    let worker = match account_service.get_worker_payment_stats_by_id(telegram_id).await? {
+        Some(w) => w,
+        None => {
+            bot.send_message(chat_id, "⚠️ Worker not found.").await?;
+            return Ok(());
+        }
+    };
+
+    let amount = if amount_str == "all" {
+        worker.remaining_cooldown
+    } else {
+        match amount_str.parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => {
+                bot.send_message(chat_id, "⚠️ Invalid payment amount.").await?;
+                return Ok(());
+            }
+        }
+    };
+
+    if amount <= 0 {
+        let msg = format!(
+            "ℹ️ <b>{}</b> has no remaining cooldowns to pay (Remaining: 0).",
+            worker.display_name
+        );
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+            "« Back to /cash",
+            "cash_back".to_string(),
+        )]]);
+        if let Some(msg_id) = msg_id {
+            bot.edit_message_text(chat_id, msg_id, msg)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(keyboard)
+                .await?;
+        } else {
+            bot.send_message(chat_id, msg)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(keyboard)
+                .await?;
+        }
+        return Ok(());
+    }
+
+    if amount > worker.remaining_cooldown {
+        let msg = format!(
+            "⚠️ Cannot pay {} cooldowns to <b>{}</b>. Remaining unpaid is only <b>{}</b>.",
+            amount, worker.display_name, worker.remaining_cooldown
+        );
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+            "« Back to /cash",
+            "cash_back".to_string(),
+        )]]);
+        if let Some(msg_id) = msg_id {
+            bot.edit_message_text(chat_id, msg_id, msg)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(keyboard)
+                .await?;
+        } else {
+            bot.send_message(chat_id, msg)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(keyboard)
+                .await?;
+        }
+        return Ok(());
+    }
+
+    match account_service.record_worker_payment(telegram_id, amount).await {
+        Ok(updated_worker) => {
+            let confirmation = format!(
+                "✅ <b>Payment Recorded!</b>\n\n\
+                👷 <b>Worker:</b> {}\n\
+                💵 <b>Paid Now:</b> {}\n\
+                💰 <b>Total Paid:</b> {}\n\
+                ⏳ <b>Remaining:</b> {}",
+                updated_worker.display_name,
+                amount,
+                updated_worker.paid_cooldown,
+                updated_worker.remaining_cooldown
+            );
+            let keyboard = InlineKeyboardMarkup::new(vec![
+                vec![InlineKeyboardButton::callback(
+                    "↩️ Undo last payment",
+                    format!("cash_undo:{}", telegram_id),
+                )],
+                vec![InlineKeyboardButton::callback("💵 Back to /cash", "cash_back".to_string())],
+            ]);
+            if let Some(msg_id) = msg_id {
+                bot.edit_message_text(chat_id, msg_id, confirmation)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .reply_markup(keyboard)
+                    .await?;
+            } else {
+                bot.send_message(chat_id, confirmation)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .reply_markup(keyboard)
+                    .await?;
+            }
+        }
+        Err(err) => {
+            bot.send_message(chat_id, format!("❌ <b>Payment Error:</b> {}", err))
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_cash_other_prompt(
+    bot: &Bot,
+    chat_id: ChatId,
+    dialogue: MyDialogue,
+    telegram_id: i64,
+    account_service: &Arc<AccountService>,
+) -> HandlerResult {
+    let worker = match account_service.get_worker_payment_stats_by_id(telegram_id).await? {
+        Some(w) => w,
+        None => {
+            bot.send_message(chat_id, "⚠️ Worker not found.").await?;
+            return Ok(());
+        }
+    };
+
+    dialogue
+        .update(State::AwaitingCustomPaymentAmount {
+            worker_telegram_id: telegram_id,
+        })
+        .await?;
+
+    bot.send_message(
+        chat_id,
+        format!(
+            "✍️ <b>Custom Payment for {}</b>\n\
+            • Remaining unpaid: <b>{}</b> cooldowns\n\n\
+            Please reply with the number of cooldowns to pay (e.g. <code>20</code>), or send /cancel:",
+            worker.display_name, worker.remaining_cooldown
+        ),
+    )
+    .parse_mode(teloxide::types::ParseMode::Html)
+    .await?;
+
+    Ok(())
+}
+
+async fn handle_custom_payment_amount(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+    worker_telegram_id: i64,
+    account_service: Arc<AccountService>,
+    admin_telegram_ids: Vec<i64>,
+) -> HandlerResult {
+    if !is_admin(&msg, &admin_telegram_ids) {
+        bot.send_message(msg.chat.id, "⛔ This action is available to administrators only.")
+            .await?;
+        return Ok(());
+    }
+
+    let raw_text = match msg.text() {
+        Some(t) => t.trim(),
+        None => {
+            bot.send_message(msg.chat.id, "⚠️ Please enter a positive whole number.")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let amount: i64 = match raw_text.parse() {
+        Ok(num) if num > 0 => num,
+        _ => {
+            bot.send_message(
+                msg.chat.id,
+                "⚠️ Invalid amount. Please enter a positive whole number greater than 0 (e.g. <code>20</code>), or send /cancel.",
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let worker = match account_service.get_worker_payment_stats_by_id(worker_telegram_id).await? {
+        Some(w) => w,
+        None => {
+            dialogue.update(State::Start).await?;
+            bot.send_message(msg.chat.id, "⚠️ Worker not found.").await?;
+            return Ok(());
+        }
+    };
+
+    if amount > worker.remaining_cooldown {
+        bot.send_message(
+            msg.chat.id,
+            format!(
+                "⚠️ Cannot pay {} cooldowns to <b>{}</b>. Remaining unpaid is only <b>{}</b>.\n\nPlease enter an amount up to {}, or send /cancel.",
+                amount, worker.display_name, worker.remaining_cooldown, worker.remaining_cooldown
+            ),
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .await?;
+        return Ok(());
+    }
+
+    match account_service.record_worker_payment(worker_telegram_id, amount).await {
+        Ok(updated_worker) => {
+            dialogue.update(State::Start).await?;
+            let confirmation = format!(
+                "✅ <b>Payment Recorded!</b>\n\n\
+                👷 <b>Worker:</b> {}\n\
+                💵 <b>Paid Now:</b> {}\n\
+                💰 <b>Total Paid:</b> {}\n\
+                ⏳ <b>Remaining:</b> {}",
+                updated_worker.display_name,
+                amount,
+                updated_worker.paid_cooldown,
+                updated_worker.remaining_cooldown
+            );
+            let keyboard = InlineKeyboardMarkup::new(vec![
+                vec![InlineKeyboardButton::callback(
+                    "↩️ Undo last payment",
+                    format!("cash_undo:{}", worker_telegram_id),
+                )],
+                vec![InlineKeyboardButton::callback("💵 Back to /cash", "cash_back".to_string())],
+            ]);
+            bot.send_message(msg.chat.id, confirmation)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(keyboard)
+                .await?;
+        }
+        Err(err) => {
+            bot.send_message(msg.chat.id, format!("❌ <b>Payment Error:</b> {}", err))
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_cash_undo(
+    bot: &Bot,
+    chat_id: ChatId,
+    msg_id: Option<MessageId>,
+    telegram_id: i64,
+    account_service: &Arc<AccountService>,
+) -> HandlerResult {
+    match account_service.undo_worker_last_payment(telegram_id).await {
+        Ok(Some((worker, reversed_amount))) => {
+            let msg = format!(
+                "↩️ <b>Payment Undone!</b>\n\n\
+                👷 <b>Worker:</b> {}\n\
+                ↩️ <b>Reversed Amount:</b> {}\n\
+                💰 <b>Total Paid:</b> {}\n\
+                ⏳ <b>Remaining:</b> {}",
+                worker.display_name,
+                reversed_amount,
+                worker.paid_cooldown,
+                worker.remaining_cooldown
+            );
+            let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                "💵 Back to /cash",
+                "cash_back".to_string(),
+            )]]);
+            if let Some(msg_id) = msg_id {
+                bot.edit_message_text(chat_id, msg_id, msg)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .reply_markup(keyboard)
+                    .await?;
+            } else {
+                bot.send_message(chat_id, msg)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .reply_markup(keyboard)
+                    .await?;
+            }
+        }
+        Ok(None) => {
+            let msg = "ℹ️ No recent payment found to undo for this worker.";
+            let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                "💵 Back to /cash",
+                "cash_back".to_string(),
+            )]]);
+            if let Some(msg_id) = msg_id {
+                bot.edit_message_text(chat_id, msg_id, msg)
+                    .reply_markup(keyboard)
+                    .await?;
+            } else {
+                bot.send_message(chat_id, msg)
+                    .reply_markup(keyboard)
+                    .await?;
+            }
+        }
+        Err(err) => {
+            bot.send_message(chat_id, format!("❌ <b>Undo Error:</b> {}", err))
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_pay_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    args: &str,
+    account_service: &Arc<AccountService>,
+) -> HandlerResult {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.len() != 2 {
+        bot.send_message(
+            chat_id,
+            "💡 <b>Usage:</b> <code>/pay &lt;list number&gt; &lt;amount&gt;</code>\n\
+            Example: <code>/pay 1 20</code>\n\n\
+            Use /cash to view the numbered list of workers.",
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .await?;
+        return Ok(());
+    }
+
+    let list_number: usize = match parts[0].parse() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            bot.send_message(
+                chat_id,
+                "⚠️ The list number must be a positive integer greater than 0.",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let amount: i64 = match parts[1].parse() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            bot.send_message(
+                chat_id,
+                "⚠️ The payment amount must be a whole number greater than 0.",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let (worker, idx, _total) = match account_service.get_worker_by_list_number(list_number).await? {
+        Some(item) => item,
+        None => {
+            let total = account_service.worker_payment_statistics().await?.len();
+            bot.send_message(
+                chat_id,
+                format!(
+                    "⚠️ Invalid worker number #{}. Please choose a number between 1 and {} from /cash.",
+                    list_number, total
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if amount > worker.remaining_cooldown {
+        bot.send_message(
+            chat_id,
+            format!(
+                "⚠️ Cannot pay {} cooldowns to <b>{}</b>. Remaining unpaid is only <b>{}</b>.",
+                amount, worker.display_name, worker.remaining_cooldown
+            ),
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .await?;
+        return Ok(());
+    }
+
+    match account_service.record_worker_payment(worker.telegram_id, amount).await {
+        Ok(updated_worker) => {
+            let confirmation = format!(
+                "✅ <b>Payment Recorded!</b>\n\n\
+                👷 <b>Worker:</b> {} (#{}) (<code>{}</code>)\n\
+                💵 <b>Paid Now:</b> {}\n\
+                💰 <b>Total Paid:</b> {}\n\
+                ⏳ <b>Remaining:</b> {}",
+                updated_worker.display_name,
+                idx,
+                updated_worker.telegram_id,
+                amount,
+                updated_worker.paid_cooldown,
+                updated_worker.remaining_cooldown
+            );
+            let keyboard = InlineKeyboardMarkup::new(vec![
+                vec![InlineKeyboardButton::callback(
+                    "↩️ Undo last payment",
+                    format!("cash_undo:{}", worker.telegram_id),
+                )],
+                vec![InlineKeyboardButton::callback("💵 Back to /cash", "cash_back".to_string())],
+            ]);
+            bot.send_message(chat_id, confirmation)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(keyboard)
+                .await?;
+        }
+        Err(err) => {
+            bot.send_message(chat_id, format!("❌ <b>Payment Error:</b> {}", err))
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_control_keyboard(workers: &[WorkerPaymentStats], page: usize) -> InlineKeyboardMarkup {
+    const PAGE_SIZE: usize = 10;
+    let total_pages = (workers.len() + PAGE_SIZE - 1).max(1) / PAGE_SIZE.max(1);
+    let total_pages = if total_pages == 0 { 1 } else { total_pages };
+    let current_page = page.min(total_pages.saturating_sub(1));
+    let start_idx = current_page * PAGE_SIZE;
+    let end_idx = (start_idx + PAGE_SIZE).min(workers.len());
+
+    let page_workers = &workers[start_idx..end_idx];
+    let mut keyboard_rows = Vec::new();
+
+    for chunk in page_workers.chunks(2) {
+        let mut row = Vec::new();
+        for w in chunk {
+            let list_num = workers
+                .iter()
+                .position(|x| x.telegram_id == w.telegram_id)
+                .unwrap_or(0)
+                + 1;
+            let btn_text = if w.is_blocked {
+                format!("✅ Unblock {}. {}", list_num, w.display_name)
+            } else {
+                format!("🚫 Block {}. {}", list_num, w.display_name)
+            };
+            row.push(InlineKeyboardButton::callback(
+                btn_text,
+                format!("ctrl_toggle:{}:{}", w.telegram_id, current_page),
+            ));
+        }
+        keyboard_rows.push(row);
+    }
+
+    if total_pages > 1 {
+        let mut nav_row = Vec::new();
+        if current_page > 0 {
+            nav_row.push(InlineKeyboardButton::callback(
+                "◀️ Prev",
+                format!("ctrl_p:{}", current_page - 1),
+            ));
+        }
+        nav_row.push(InlineKeyboardButton::callback(
+            format!("Page {}/{}", current_page + 1, total_pages),
+            format!("ctrl_p:{}", current_page),
+        ));
+        if current_page + 1 < total_pages {
+            nav_row.push(InlineKeyboardButton::callback(
+                "Next ▶️",
+                format!("ctrl_p:{}", current_page + 1),
+            ));
+        }
+        keyboard_rows.push(nav_row);
+    }
+
+    InlineKeyboardMarkup::new(keyboard_rows)
+}
+
+async fn send_control_center(
+    bot: &Bot,
+    chat_id: ChatId,
+    account_service: &Arc<AccountService>,
+    page: usize,
+    edit_message_id: Option<MessageId>,
+) -> HandlerResult {
+    let workers = account_service.worker_payment_statistics().await?;
+    if workers.is_empty() {
+        if let Some(msg_id) = edit_message_id {
+            bot.edit_message_text(chat_id, msg_id, "ℹ️ No workers are registered yet.")
+                .await?;
+        } else {
+            bot.send_message(chat_id, "ℹ️ No workers are registered yet.")
+                .await?;
+        }
+        return Ok(());
+    }
+
+    let blocked_count = workers.iter().filter(|w| w.is_blocked).count();
+    let active_count = workers.len() - blocked_count;
+
+    let mut report = format!(
+        "🛡️ <b>Worker Control Center</b>\n\n\
+        Workers: {} total (🟢 {} active, ❌ {} blocked)\n\n\
+        <i>Blocked workers cannot register new phone numbers and the bot ignores them. All their existing accounts stay active and voting 24/7.</i>\n\n",
+        workers.len(),
+        active_count,
+        blocked_count
+    );
+
+    for (idx, worker) in workers.iter().enumerate() {
+        let status_icon = if worker.is_blocked { "❌" } else { "🟢" };
+        let status_label = if worker.is_blocked { "BLOCKED" } else { "Active" };
+        report.push_str(&format!(
+            "{}. {} <b>{}</b> [{}] — {} account(s) (<code>{}</code>)\n",
+            idx + 1,
+            status_icon,
+            worker.display_name,
+            status_label,
+            worker.account_count,
+            worker.telegram_id
+        ));
+    }
+
+    report.push_str("\n💡 <i>Tap a button below or type <code>/control &lt;number&gt;</code> to block/unblock.</i>");
+
+    let keyboard = build_control_keyboard(&workers, page);
+
+    if let Some(msg_id) = edit_message_id {
+        if report.len() <= 3800 {
+            bot.edit_message_text(chat_id, msg_id, report)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(keyboard)
+                .await?;
+            return Ok(());
+        } else {
+            let _ = bot.delete_message(chat_id, msg_id).await;
+        }
+    }
+
+    if report.len() <= 3800 {
+        bot.send_message(chat_id, report)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .reply_markup(keyboard)
+            .await?;
+    } else {
+        let mut chunks = Vec::new();
+        let mut current_chunk = String::new();
+        for line in report.lines() {
+            if current_chunk.len() + line.len() + 1 > 3800 {
+                chunks.push(current_chunk);
+                current_chunk = String::new();
+            }
+            if !current_chunk.is_empty() {
+                current_chunk.push('\n');
+            }
+            current_chunk.push_str(line);
+        }
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut send = bot.send_message(chat_id, chunk).parse_mode(teloxide::types::ParseMode::Html);
+            if i == chunks.len() - 1 {
+                send = send.reply_markup(keyboard.clone());
+            }
+            send.await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_control_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    args: &str,
+    account_service: &Arc<AccountService>,
+) -> HandlerResult {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return send_control_center(bot, chat_id, account_service, 0, None).await;
+    }
+
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    let (action, list_str) = match parts.len() {
+        1 => (None, parts[0]),
+        2 => (Some(parts[0].to_lowercase()), parts[1]),
+        _ => {
+            bot.send_message(
+                chat_id,
+                "⚠️ Usage: <code>/control</code> or <code>/control &lt;number&gt;</code> (e.g. <code>/control 2</code>).",
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let list_number = match list_str.parse::<usize>() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            bot.send_message(
+                chat_id,
+                format!("⚠️ Invalid worker number '{}'. Please provide a number from <code>/control</code>.", list_str),
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let (worker, idx, _total) = match account_service.get_worker_by_list_number(list_number).await? {
+        Some(item) => item,
+        None => {
+            let total = account_service.worker_payment_statistics().await?.len();
+            bot.send_message(
+                chat_id,
+                format!("⚠️ Invalid worker number #{}. Please choose a number between 1 and {} from /control.", list_number, total),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let (name, is_blocked) = match action.as_deref() {
+        Some("block") => {
+            account_service.set_worker_blocked_status(worker.telegram_id, true).await?;
+            (worker.display_name.clone(), true)
+        }
+        Some("unblock") => {
+            account_service.set_worker_blocked_status(worker.telegram_id, false).await?;
+            (worker.display_name.clone(), false)
+        }
+        _ => {
+            account_service.toggle_worker_blocked_status(worker.telegram_id).await?
+                .unwrap_or((worker.display_name.clone(), !worker.is_blocked))
+        }
+    };
+
+    let page = idx.saturating_sub(1) / 10;
+
+    if is_blocked {
+        bot.send_message(
+            chat_id,
+            format!(
+                "❌ <b>Worker Blocked!</b>\n\n\
+                👷 <b>Worker:</b> {} (#{})\n\
+                🆔 <b>Telegram ID:</b> <code>{}</code>\n\
+                📊 <b>Accounts in database:</b> {}\n\n\
+                • This worker is now blocked and ignored by the bot.\n\
+                • They cannot register or add any new phone numbers.\n\
+                • All their {} existing accounts remain safe and active in the 24/7 vote schedule.",
+                name, idx, worker.telegram_id, worker.account_count, worker.account_count
+            ),
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback(format!("✅ Unblock {}. {}", idx, name), format!("ctrl_toggle:{}", worker.telegram_id)),
+            InlineKeyboardButton::callback("🛡️ View /control", "ctrl_p:0".to_string()),
+            InlineKeyboardButton::callback(format!("✅ Unblock {}. {}", idx, name), format!("ctrl_toggle:{}:{}", worker.telegram_id, page)),
+            InlineKeyboardButton::callback("🛡️ View /control", format!("ctrl_p:{}", page)),
+        ]]))
+        .await?;
+    } else {
+        bot.send_message(
+            chat_id,
+            format!(
+                "✅ <b>Worker Unblocked!</b>\n\n\
+                👷 <b>Worker:</b> {} (#{})\n\
+                🆔 <b>Telegram ID:</b> <code>{}</code>\n\n\
+                • This worker has been restored to active status.\n\
+                • They can now use the bot normally.",
+                name, idx, worker.telegram_id
+            ),
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback(format!("🚫 Block {}. {}", idx, name), format!("ctrl_toggle:{}:{}", worker.telegram_id, page)),
+            InlineKeyboardButton::callback("🛡️ View /control", format!("ctrl_p:{}", page)),
+        ]]))
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_applicant_name(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+    account_service: Arc<AccountService>,
+    admin_telegram_ids: Vec<i64>,
+) -> HandlerResult {
+    let Some(name) = msg.text().map(str::trim).filter(|name| !name.is_empty()) else {
+        bot.send_message(msg.chat.id, "Please enter a valid name, or use /cancel.")
+            .await?;
+        return Ok(());
+    };
+
+    let Some(user) = msg.from.as_ref() else {
+        bot.send_message(msg.chat.id, "Could not identify your Telegram account. Please try again.")
+            .await?;
+        return Ok(());
+    };
+
+    let res = account_service.apply_as_worker(user.id.0 as i64, name).await?;
+    dialogue.update(State::Start).await?;
+
+    match res {
+        ApplyResult::Submitted => {
+            bot.send_message(
+                msg.chat.id,
+                format!(
+                    "⏳ <b>Application Submitted!</b>\n\n\
+                    Thank you, <b>{}</b>. Your request has been sent to the administrators.\n\
+                    Please wait until an administrator accepts or rejects your application.",
+                    name
+                ),
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+
+            // Notify all admins, especially primary admin 5924416179
+            let notify_text = format!(
+                "🔔 <b>New Worker Application Received!</b>\n\n\
+                👷 <b>Name:</b> {}\n\
+                🆔 <b>Telegram ID:</b> <code>{}</code>\n\
+                👤 <b>Username:</b> @{}\n\n\
+                Choose an action below or send /request:",
+                name,
+                user.id.0,
+                user.username.as_deref().unwrap_or("none")
+            );
+            let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback("✅ Accept", format!("req_accept:{}", user.id.0)),
+                InlineKeyboardButton::callback("🚫 Reject", format!("req_reject:{}", user.id.0)),
+            ]]);
+
+            for admin_id in &admin_telegram_ids {
+                let _ = bot.send_message(ChatId(*admin_id), notify_text.clone())
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .reply_markup(keyboard.clone())
+                    .await;
+            }
+        }
+        ApplyResult::AlreadyActive(name) => {
+            bot.send_message(
+                msg.chat.id,
+                format!("ℹ️ You are already registered and active as worker <b>{}</b>.", name),
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+        }
+        ApplyResult::AlreadyPending => {
+            bot.send_message(
+                msg.chat.id,
+                "⏳ Your application is already submitted and waiting for review. Please wait until an administrator accepts or rejects your application.",
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_pending_requests(
+    bot: &Bot,
+    chat_id: ChatId,
+    account_service: &Arc<AccountService>,
+    edit_message_id: Option<MessageId>,
+) -> HandlerResult {
+    let pending = account_service.list_pending_worker_applications().await?;
+    if pending.is_empty() {
+        let text = "ℹ️ <b>No pending worker applications.</b>\n\nAll applications have been reviewed.";
+        if let Some(msg_id) = edit_message_id {
+            bot.edit_message_text(chat_id, msg_id, text)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .await?;
+        } else {
+            bot.send_message(chat_id, text)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .await?;
+        }
+        return Ok(());
+    }
+
+    let mut report = format!(
+        "📋 <b>Worker Applications Pending Approval</b>\n\n\
+        Pending requests: <b>{}</b>\n\n",
+        pending.len()
+    );
+
+    let mut keyboard_rows = Vec::new();
+    for (idx, app) in pending.iter().enumerate() {
+        report.push_str(&format!(
+            "{}. <b>{}</b> (<code>{}</code>)\n",
+            idx + 1,
+            app.display_name,
+            app.telegram_id
+        ));
+
+        keyboard_rows.push(vec![
+            InlineKeyboardButton::callback(
+                format!("✅ Accept {}. {}", idx + 1, app.display_name),
+                format!("req_accept:{}", app.telegram_id),
+            ),
+            InlineKeyboardButton::callback(
+                format!("🚫 Reject {}. {}", idx + 1, app.display_name),
+                format!("req_reject:{}", app.telegram_id),
+            ),
+        ]);
+    }
+
+    let keyboard = InlineKeyboardMarkup::new(keyboard_rows);
+
+    if let Some(msg_id) = edit_message_id {
+        bot.edit_message_text(chat_id, msg_id, report)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .reply_markup(keyboard)
+            .await?;
+    } else {
+        bot.send_message(chat_id, report)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .reply_markup(keyboard)
+            .await?;
+    }
+
+    Ok(())
 }

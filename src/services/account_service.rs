@@ -18,6 +18,18 @@ pub struct WorkerStatistics {
     pub display_name: String,
     pub account_count: i64,
     pub cooldown_count: i64,
+    pub is_blocked: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerPaymentStats {
+    pub telegram_id: i64,
+    pub display_name: String,
+    pub account_count: i64,
+    pub cooldown_count: i64,
+    pub paid_cooldown: i64,
+    pub remaining_cooldown: i64,
+    pub is_blocked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +47,22 @@ pub struct WorkerCheckAccount {
     pub worker_telegram_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerApplication {
+    pub telegram_id: i64,
+    pub display_name: String,
+    pub registered_at: String,
+    pub approval_status: String,
+    pub is_blocked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyResult {
+    Submitted,
+    AlreadyActive(String),
+    AlreadyPending,
 }
 
 #[derive(Debug, Clone)]
@@ -222,7 +250,7 @@ impl AccountService {
     }
 
     pub async fn worker_statistics(&self) -> Result<Vec<WorkerStatistics>, AppError> {
-        Ok(sqlx::query_as::<_, (i64, String, i64, i64)>(
+        Ok(sqlx::query_as::<_, (i64, String, i64, i64, i64)>(
             "SELECT w.telegram_id,
                     w.display_name,
                     COUNT(DISTINCT a.id) AS account_count,
@@ -231,7 +259,8 @@ impl AccountService {
                          AND latest.completed_at IS NOT NULL
                          AND datetime(latest.completed_at, '+12 hours') > datetime('now')
                         THEN 1 ELSE 0
-                    END) AS cooldown_count
+                    END) AS cooldown_count,
+                    COALESCE(w.is_blocked, 0) AS is_blocked
              FROM telegram_workers w
              LEFT JOIN phone_accounts a ON a.added_by_telegram_id = w.telegram_id
              LEFT JOIN (
@@ -246,12 +275,13 @@ impl AccountService {
         .fetch_all(&self.pool)
         .await?
         .into_iter()
-        .map(|(telegram_id, display_name, account_count, cooldown_count)| {
+        .map(|(telegram_id, display_name, account_count, cooldown_count, is_blocked)| {
             WorkerStatistics {
                 telegram_id,
                 display_name,
                 account_count,
                 cooldown_count,
+                is_blocked: is_blocked != 0,
             }
         })
         .collect())
@@ -259,7 +289,7 @@ impl AccountService {
 
     /// Returns accounts first registered by each worker during the last 12 hours.
     pub async fn payment_statistics(&self) -> Result<Vec<WorkerStatistics>, AppError> {
-        Ok(sqlx::query_as::<_, (i64, String, i64, i64)>(
+        Ok(sqlx::query_as::<_, (i64, String, i64, i64, i64)>(
             "SELECT w.telegram_id,
                     w.display_name,
                     COUNT(DISTINCT a.id) AS account_count,
@@ -268,7 +298,8 @@ impl AccountService {
                          AND latest.completed_at IS NOT NULL
                          AND datetime(latest.completed_at, '+12 hours') > datetime('now')
                         THEN 1 ELSE 0
-                    END) AS cooldown_count
+                    END) AS cooldown_count,
+                    COALESCE(w.is_blocked, 0) AS is_blocked
              FROM telegram_workers w
              INNER JOIN phone_accounts a
                  ON a.added_by_telegram_id = w.telegram_id
@@ -285,15 +316,444 @@ impl AccountService {
         .fetch_all(&self.pool)
         .await?
         .into_iter()
-        .map(|(telegram_id, display_name, account_count, cooldown_count)| {
+        .map(|(telegram_id, display_name, account_count, cooldown_count, is_blocked)| {
             WorkerStatistics {
                 telegram_id,
                 display_name,
                 account_count,
                 cooldown_count,
+                is_blocked: is_blocked != 0,
             }
         })
         .collect())
+    }
+
+    /// Fetches live payment statistics for all workers, including cooldown count, paid count, and remaining unpaid.
+    pub async fn worker_payment_statistics(&self) -> Result<Vec<WorkerPaymentStats>, AppError> {
+        Ok(sqlx::query_as::<_, (i64, String, i64, i64, i64, i64)>(
+            "SELECT w.telegram_id,
+                    w.display_name,
+                    COUNT(DISTINCT a.id) AS account_count,
+                    SUM(CASE
+                        WHEN a.registration_status = 'VERIFIED'
+                         AND latest.completed_at IS NOT NULL
+                         AND datetime(latest.completed_at, '+24 hours') > datetime('now')
+                        THEN 1 ELSE 0
+                    END) AS cooldown_count,
+                    COALESCE(w.paid_cooldown, 0) AS paid_cooldown,
+                    COALESCE(w.is_blocked, 0) AS is_blocked
+             FROM telegram_workers w
+             LEFT JOIN phone_accounts a ON a.added_by_telegram_id = w.telegram_id
+             LEFT JOIN (
+                SELECT phone_account_id, MAX(scraping_completed_at) AS completed_at
+                FROM scraping_history
+                WHERE scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
+                GROUP BY phone_account_id
+             ) latest ON latest.phone_account_id = a.id
+             GROUP BY w.telegram_id, w.display_name
+             ORDER BY account_count DESC, w.display_name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(telegram_id, display_name, account_count, cooldown_count, paid_cooldown, is_blocked)| {
+            let remaining_cooldown = (cooldown_count - paid_cooldown).max(0);
+            WorkerPaymentStats {
+                telegram_id,
+                display_name,
+                account_count,
+                cooldown_count,
+                paid_cooldown,
+                remaining_cooldown,
+                is_blocked: is_blocked != 0,
+            }
+        })
+        .collect())
+    }
+
+    /// Checks whether a worker is blocked or unapproved by their Telegram ID.
+    pub async fn is_worker_blocked(&self, telegram_id: i64) -> Result<bool, AppError> {
+        let row = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT COALESCE(is_blocked, 0), approval_status FROM telegram_workers WHERE telegram_id = ?"
+        )
+        .bind(telegram_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row
+            .map(|(b, status)| b != 0 || status.as_deref() == Some("REJECTED"))
+            .unwrap_or(false))
+    }
+
+    /// Fetches worker approval and blocked details.
+    pub async fn get_worker_status_details(
+        &self,
+        telegram_id: i64,
+    ) -> Result<Option<(String, String, bool)>, AppError> {
+        let row = sqlx::query_as::<_, (String, Option<String>, i64)>(
+            "SELECT display_name, approval_status, COALESCE(is_blocked, 0) FROM telegram_workers WHERE telegram_id = ?"
+        )
+        .bind(telegram_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(name, status, b)| {
+            (name, status.unwrap_or_else(|| "APPROVED".to_string()), b != 0)
+        }))
+    }
+
+    /// Applies as a new worker.
+    pub async fn apply_as_worker(
+        &self,
+        telegram_id: i64,
+        display_name: &str,
+    ) -> Result<ApplyResult, AppError> {
+        let existing = sqlx::query_as::<_, (String, Option<String>, i64)>(
+            "SELECT display_name, approval_status, COALESCE(is_blocked, 0)
+             FROM telegram_workers WHERE telegram_id = ?"
+        )
+        .bind(telegram_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((current_name, status, is_blocked)) = existing {
+            let status = status.unwrap_or_else(|| "APPROVED".to_string());
+            if status == "APPROVED" && is_blocked == 0 {
+                return Ok(ApplyResult::AlreadyActive(current_name));
+            } else if status == "PENDING" {
+                sqlx::query("UPDATE telegram_workers SET display_name = ? WHERE telegram_id = ?")
+                    .bind(display_name)
+                    .bind(telegram_id)
+                    .execute(&self.pool)
+                    .await?;
+                return Ok(ApplyResult::AlreadyPending);
+            } else {
+                sqlx::query(
+                    "UPDATE telegram_workers 
+                     SET display_name = ?, approval_status = 'PENDING', is_blocked = 1, registered_at = ? 
+                     WHERE telegram_id = ?"
+                )
+                .bind(display_name)
+                .bind(Utc::now().to_rfc3339())
+                .bind(telegram_id)
+                .execute(&self.pool)
+                .await?;
+                return Ok(ApplyResult::Submitted);
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO telegram_workers (telegram_id, display_name, registered_at, paid_cooldown, is_blocked, approval_status)
+             VALUES (?, ?, ?, 0, 1, 'PENDING')"
+        )
+        .bind(telegram_id)
+        .bind(display_name)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(ApplyResult::Submitted)
+    }
+
+    /// Lists workers whose application is PENDING.
+    pub async fn list_pending_worker_applications(&self) -> Result<Vec<WorkerApplication>, AppError> {
+        let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, i64)>(
+            "SELECT telegram_id, display_name, registered_at, approval_status, COALESCE(is_blocked, 0)
+             FROM telegram_workers
+             WHERE approval_status = 'PENDING'
+             ORDER BY registered_at DESC"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(telegram_id, display_name, registered_at, approval_status, is_blocked)| {
+                WorkerApplication {
+                    telegram_id,
+                    display_name,
+                    registered_at,
+                    approval_status: approval_status.unwrap_or_else(|| "PENDING".to_string()),
+                    is_blocked: is_blocked != 0,
+                }
+            })
+            .collect())
+    }
+
+    /// Approves a pending application, activating the worker.
+    pub async fn approve_worker_application(&self, telegram_id: i64) -> Result<Option<String>, AppError> {
+        let row = sqlx::query_as::<_, (String,)>(
+            "SELECT display_name FROM telegram_workers WHERE telegram_id = ?"
+        )
+        .bind(telegram_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let (name,) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        sqlx::query(
+            "UPDATE telegram_workers SET approval_status = 'APPROVED', is_blocked = 0 WHERE telegram_id = ?"
+        )
+        .bind(telegram_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(Some(name))
+    }
+
+    /// Rejects a pending application, marking as REJECTED and blocked.
+    pub async fn reject_worker_application(&self, telegram_id: i64) -> Result<Option<String>, AppError> {
+        let row = sqlx::query_as::<_, (String,)>(
+            "SELECT display_name FROM telegram_workers WHERE telegram_id = ?"
+        )
+        .bind(telegram_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let (name,) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        sqlx::query(
+            "UPDATE telegram_workers SET approval_status = 'REJECTED', is_blocked = 1 WHERE telegram_id = ?"
+        )
+        .bind(telegram_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(Some(name))
+    }
+
+    /// Toggles the blocked status of a worker, returning their name and new blocked state.
+    pub async fn toggle_worker_blocked_status(
+        &self,
+        telegram_id: i64,
+    ) -> Result<Option<(String, bool)>, AppError> {
+        let row = sqlx::query_as::<_, (String, i64)>(
+            "SELECT display_name, COALESCE(is_blocked, 0) FROM telegram_workers WHERE telegram_id = ?"
+        )
+        .bind(telegram_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let (display_name, current_blocked) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let new_blocked = if current_blocked != 0 { 0 } else { 1 };
+        sqlx::query("UPDATE telegram_workers SET is_blocked = ? WHERE telegram_id = ?")
+            .bind(new_blocked)
+            .bind(telegram_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(Some((display_name, new_blocked != 0)))
+    }
+
+    /// Sets the blocked status explicitly.
+    pub async fn set_worker_blocked_status(
+        &self,
+        telegram_id: i64,
+        blocked: bool,
+    ) -> Result<Option<String>, AppError> {
+        let row = sqlx::query_as::<_, (String,)>(
+            "SELECT display_name FROM telegram_workers WHERE telegram_id = ?"
+        )
+        .bind(telegram_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let (display_name,) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        sqlx::query("UPDATE telegram_workers SET is_blocked = ? WHERE telegram_id = ?")
+            .bind(if blocked { 1 } else { 0 })
+            .bind(telegram_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(Some(display_name))
+    }
+
+    /// Fetches payment statistics for a specific worker by Telegram ID.
+    pub async fn get_worker_payment_stats_by_id(
+        &self,
+        telegram_id: i64,
+    ) -> Result<Option<WorkerPaymentStats>, AppError> {
+        let workers = self.worker_payment_statistics().await?;
+        Ok(workers.into_iter().find(|w| w.telegram_id == telegram_id))
+    }
+
+    /// Fetches a worker by their 1-based position in the `/cash` list.
+    pub async fn get_worker_by_list_number(
+        &self,
+        list_number: usize,
+    ) -> Result<Option<(WorkerPaymentStats, usize, usize)>, AppError> {
+        let workers = self.worker_payment_statistics().await?;
+        let total = workers.len();
+        if list_number >= 1 && list_number <= total {
+            let worker = workers[list_number - 1].clone();
+            Ok(Some((worker, list_number, total)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Records a payment in cooldown units for a worker.
+    pub async fn record_worker_payment(
+        &self,
+        worker_telegram_id: i64,
+        amount: i64,
+    ) -> Result<WorkerPaymentStats, AppError> {
+        if amount <= 0 {
+            return Err(AppError::Payment(
+                "Payment amount must be greater than 0.".to_string(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        // 1. Fetch current worker details
+        let worker_row = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT display_name, paid_cooldown, COALESCE(is_blocked, 0) FROM telegram_workers WHERE telegram_id = ?",
+        )
+        .bind(worker_telegram_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let (display_name, current_paid, is_blocked) = match worker_row {
+            Some(row) => row,
+            None => {
+                return Err(AppError::Payment(format!(
+                    "Worker with ID {} not found.",
+                    worker_telegram_id
+                )))
+            }
+        };
+
+        // 2. Fetch live cooldown count
+        let (cooldown_count,): (Option<i64>,) = sqlx::query_as(
+            "SELECT SUM(CASE
+                 WHEN a.registration_status = 'VERIFIED'
+                  AND latest.completed_at IS NOT NULL
+                  AND datetime(latest.completed_at, '+24 hours') > datetime('now')
+                 THEN 1 ELSE 0
+             END)
+             FROM phone_accounts a
+             LEFT JOIN (
+                SELECT phone_account_id, MAX(scraping_completed_at) AS completed_at
+                FROM scraping_history
+                WHERE scraping_status IN ('SUCCESS', 'ALREADY_VOTED')
+                GROUP BY phone_account_id
+             ) latest ON latest.phone_account_id = a.id
+             WHERE a.added_by_telegram_id = ?",
+        )
+        .bind(worker_telegram_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let cooldown = cooldown_count.unwrap_or(0);
+        let remaining = (cooldown - current_paid).max(0);
+        if amount > remaining {
+            return Err(AppError::Payment(format!(
+                "Cannot pay {} cooldowns to {}. Remaining unpaid is only {}.",
+                amount, display_name, remaining
+            )));
+        }
+
+        let new_paid = current_paid + amount;
+        let now_str = Utc::now().to_rfc3339();
+
+        // 3. Update paid_cooldown
+        sqlx::query("UPDATE telegram_workers SET paid_cooldown = ? WHERE telegram_id = ?")
+            .bind(new_paid)
+            .bind(worker_telegram_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // 4. Insert into payment log
+        sqlx::query(
+            "INSERT INTO worker_payments (worker_telegram_id, amount_paid, paid_at, is_reversed) VALUES (?, ?, ?, 0)",
+        )
+        .bind(worker_telegram_id)
+        .bind(amount)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        let (account_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT id) FROM phone_accounts WHERE added_by_telegram_id = ?",
+        )
+        .bind(worker_telegram_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(WorkerPaymentStats {
+            telegram_id: worker_telegram_id,
+            display_name,
+            account_count,
+            cooldown_count: cooldown,
+            paid_cooldown: new_paid,
+            remaining_cooldown: (cooldown - new_paid).max(0),
+            is_blocked: is_blocked != 0,
+        })
+    }
+
+    /// Reverses the most recent non-reversed payment for a worker.
+    pub async fn undo_worker_last_payment(
+        &self,
+        worker_telegram_id: i64,
+    ) -> Result<Option<(WorkerPaymentStats, i64)>, AppError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Find last non-reversed payment
+        let last_payment = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT id, amount_paid FROM worker_payments 
+             WHERE worker_telegram_id = ? AND is_reversed = 0 
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(worker_telegram_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let (payment_id, amount_to_undo) = match last_payment {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let now_str = Utc::now().to_rfc3339();
+
+        // Mark payment as reversed
+        sqlx::query("UPDATE worker_payments SET is_reversed = 1, reversed_at = ? WHERE id = ?")
+            .bind(&now_str)
+            .bind(payment_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Deduct paid_cooldown
+        sqlx::query("UPDATE telegram_workers SET paid_cooldown = MAX(0, paid_cooldown - ?) WHERE telegram_id = ?")
+            .bind(amount_to_undo)
+            .bind(worker_telegram_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        let updated_stats = self.get_worker_payment_stats_by_id(worker_telegram_id).await?;
+        if let Some(stats) = updated_stats {
+            Ok(Some((stats, amount_to_undo)))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn pending_otp_accounts(&self) -> Result<Vec<PendingOtpAccount>, AppError> {
@@ -643,7 +1103,7 @@ impl AccountService {
         .fetch_one(&self.pool)
         .await?;
 
-        let total_claimed_count = fresh_claimed_count + already_voted_count;
+        let _total_claimed_count = fresh_claimed_count + already_voted_count;
 
         let failed_rows = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>, Option<i64>, Option<String>)>(
             "SELECT h.phone_account_id, p.phone_number, p.label, h.error_message, h.response_status, h.retry_after
