@@ -24,15 +24,15 @@ const MAX_CONCURRENT_TASKS: usize = 5;
 /// Starts the daily autonomous background scheduler.
 ///
 /// ## Timing & Behavior
-/// - Daily runs start at 02:00 UTC (two hours after the target website's 00:00 UTC quota reset).
-/// - If started after 02:00 UTC (or on restart), it begins processing immediately.
+/// - Daily runs start at 05:00 UTC (08:00 AM Ethiopian Time EAT).
+/// - If started after 05:00 UTC (or on restart), it begins processing immediately.
 /// - Accounts are claimed in batches of 100 with a 5-minute gap between batches.
 /// - Within each batch, up to 5 accounts vote concurrently.
 /// - If any account encounters an error, its next attempt is scheduled 1 hour later (`retry_after`).
 /// - The batching continues until all ready accounts are claimed.
 /// - If all ready accounts are claimed but some accounts are awaiting their 1-hour retry,
 ///   the scheduler waits until that retry window opens, claims them, and only sleeps until
-///   tomorrow's 02:00 UTC once all eligible accounts are fully finished.
+///   tomorrow's 05:00 UTC once all eligible accounts are fully finished.
 pub fn start_autonomous_scheduler(
     account_service: Arc<AccountService>,
     scraping_service: Arc<ScrapingService>,
@@ -51,27 +51,33 @@ pub fn start_autonomous_scheduler(
 
         loop {
             let now = Utc::now();
-            let today_0200 = today_run_utc(now);
+            let today_run = today_run_utc(now);
 
-            // If it's before today's 02:00 UTC, wait until 02:00 UTC.
-            if now < today_0200 {
-                let wait_duration = (today_0200 - now)
+            // If it's before today's scheduled run time, wait until it starts.
+            if now < today_run {
+                let wait_duration = (today_run - now)
                     .to_std()
                     .unwrap_or(Duration::from_secs(0));
 
                 tracing::info!(
-                    "Daily scheduler: waiting until today's 02:00 UTC (in {:.1} hours).",
+                    "Daily scheduler: waiting until today's {:02}:{:02} UTC (in {:.1} hours).",
+                    DAILY_RUN_HOUR,
+                    DAILY_RUN_MINUTE,
                     wait_duration.as_secs_f64() / 3600.0
                 );
 
                 sleep(wait_duration).await;
             }
 
-            tracing::info!("Daily scheduler: 02:00 UTC cycle active — beginning batched claiming pass.");
+            tracing::info!(
+                "Daily scheduler: {:02}:{:02} UTC cycle active — beginning batched claiming pass.",
+                DAILY_RUN_HOUR,
+                DAILY_RUN_MINUTE
+            );
             run_batched_daily_pass(&account_service, &scraping_service).await;
 
             // Pass complete (all accounts claimed and all 1-hour retries completed for today).
-            // Sleep until tomorrow's 02:00 UTC.
+            // Sleep until tomorrow's scheduled run time.
             let now = Utc::now();
             let next_run = next_daily_run_utc(now);
             let wait_duration = (next_run - now)
@@ -200,7 +206,7 @@ async fn process_batch_concurrently(
 
 /// Attempts the vote action for one account once.
 ///
-/// - On success (`SUCCESS` or `ALREADY_VOTED`), sets `next_eligible_at` to tomorrow 02:00 UTC.
+/// - On success (`SUCCESS` or `ALREADY_VOTED`), sets `next_eligible_at` to tomorrow 05:00 UTC.
 /// - On any error, `scraping_service` writes `retry_after = completed_at + 1 hour` to the DB row.
 ///   The account will be retried in the next batch after that 1-hour window elapses.
 async fn process_account_once(scraping_service: &Arc<ScrapingService>, account_id: i64) {
@@ -208,8 +214,8 @@ async fn process_account_once(scraping_service: &Arc<ScrapingService>, account_i
         Ok(rec) => match rec.scraping_status {
             ScrapingStatus::AlreadyVoted => {
                 tracing::info!(
-                    "Daily scheduler: account #{} — already voted today; next eligible at 02:00 UTC tomorrow.",
-                    account_id
+                    "Daily scheduler: account #{} — already voted today; next eligible at {:02}:{:02} UTC tomorrow.",
+                    account_id, DAILY_RUN_HOUR, DAILY_RUN_MINUTE
                 );
             }
             ScrapingStatus::Success => {

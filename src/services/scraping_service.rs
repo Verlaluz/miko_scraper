@@ -107,7 +107,7 @@ impl ScrapingService {
             }
         } else {
             // Already acted since today's 00:00 UTC reset.
-            // Next eligible run is at tomorrow's 02:00 UTC.
+            // Next eligible run is at tomorrow's 05:00 UTC.
             let next = crate::scheduler::rate_limit::next_daily_run_utc(now);
             let remaining = (next - now).num_seconds().max(0);
             ScrapeCooldownInfo {
@@ -274,7 +274,7 @@ impl ScrapingService {
                 let records_scraped = if data.already_voted { 0 } else { data.records_count };
 
                 // Single timer rule: after a confirmed outcome (success or already-voted),
-                // set next_eligible_at to the next 02:00 UTC.  This is the shared daily
+                // set next_eligible_at to the next 05:00 UTC.  This is the shared daily
                 // run time for all accounts, two hours after the website's 00:00 UTC reset.
                 // The timer is started only now that the outcome is confirmed.
                 let next_eligible_at = next_daily_run_utc(completed_at);

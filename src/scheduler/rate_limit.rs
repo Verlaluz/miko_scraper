@@ -7,9 +7,8 @@ pub const DAILY_RESET_HOUR: u32 = 0;
 pub const DAILY_RESET_MINUTE: u32 = 0;
 
 /// Fixed UTC time-of-day at which the daily run executes for all accounts.
-/// Set two hours after the website's 00:00 UTC reset to ensure the quota is
-/// fully refreshed before the bot acts.
-pub const DAILY_RUN_HOUR: u32 = 2;
+/// Configured to 05:00 UTC (08:00 AM Ethiopian Time EAT).
+pub const DAILY_RUN_HOUR: u32 = 5;
 pub const DAILY_RUN_MINUTE: u32 = 0;
 
 /// Minimum and maximum inter-record delay (seconds) during the daily run.
@@ -18,7 +17,7 @@ pub const DAILY_RUN_MINUTE: u32 = 0;
 pub const INTER_RECORD_DELAY_MIN_SECS: u64 = 2;
 pub const INTER_RECORD_DELAY_MAX_SECS: u64 = 5;
 
-/// Returns today's 02:00 UTC boundary.
+/// Returns today's 05:00 UTC boundary.
 pub fn today_run_utc(reference: DateTime<Utc>) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(
         reference.year(),
@@ -32,8 +31,8 @@ pub fn today_run_utc(reference: DateTime<Utc>) -> DateTime<Utc> {
     .expect("valid date")
 }
 
-/// Returns the next 02:00 UTC boundary strictly after `reference`.
-/// If `reference` is exactly at 02:00 UTC, returns the *following* day's 02:00 UTC.
+/// Returns the next 05:00 UTC boundary strictly after `reference`.
+/// If `reference` is exactly at 05:00 UTC, returns the *following* day's 05:00 UTC.
 pub fn next_daily_run_utc(reference: DateTime<Utc>) -> DateTime<Utc> {
     let today_run = Utc
         .with_ymd_and_hms(
@@ -62,17 +61,17 @@ pub fn last_midnight_utc(now: DateTime<Utc>) -> DateTime<Utc> {
 }
 
 /// Computes per-account eligibility based on UTC day boundaries and the fixed
-/// 02:00 UTC daily run time.
+/// 05:00 UTC daily run time.
 ///
 /// # Rules
 /// - **Never acted on** → eligible immediately.
 /// - **Last completed before today's 00:00 UTC** → eligible (quota has reset).
 /// - **Last completed at or after today's 00:00 UTC** (already acted today):
 ///   - `is_eligible = false`
-///   - `next_eligible_at = next 02:00 UTC`
+///   - `next_eligible_at = next 05:00 UTC`
 ///
 /// The stored `next_eligible_at` set by the scraping service (always the next
-/// 02:00 UTC) takes precedence over this fallback when it is present.
+/// 05:00 UTC) takes precedence over this fallback when it is present.
 pub fn calculate_cooldown(
     phone_account_id: i64,
     last_successful_scrape: Option<DateTime<Utc>>,
@@ -102,7 +101,7 @@ pub fn calculate_cooldown(
                     remaining_seconds: 0,
                 }
             } else {
-                // Already acted since last 00:00 UTC reset. Next run is at 02:00 UTC tomorrow.
+                // Already acted since last 00:00 UTC reset. Next run is at 05:00 UTC tomorrow.
                 let next = next_daily_run_utc(now);
                 let remaining = (next - now).num_seconds().max(0);
                 ScrapeCooldownInfo {
@@ -147,16 +146,16 @@ mod tests {
     #[test]
     fn acted_this_morning_is_not_eligible() {
         // Voted at 00:30 UTC today → after today's midnight → not eligible.
-        // Next run is at 02:00 UTC tomorrow.
+        // Next run is at 05:00 UTC tomorrow.
         let now = utc(2026, 11, 10, 14, 0, 0);
         let last = utc(2026, 11, 10, 0, 30, 0);
         let info = calculate_cooldown(1, Some(last), now);
         assert!(!info.is_eligible);
-        // next eligible = tomorrow 02:00 UTC = 2026-11-11T02:00:00Z
-        let expected_next = utc(2026, 11, 11, 2, 0, 0);
+        // next eligible = tomorrow 05:00 UTC = 2026-11-11T05:00:00Z
+        let expected_next = utc(2026, 11, 11, 5, 0, 0);
         assert_eq!(info.next_eligible_at, Some(expected_next));
-        // remaining ≈ (11-11 02:00 - 11-10 14:00) = 12 hours = 43200 s
-        assert!(info.remaining_seconds > 43190 && info.remaining_seconds <= 43200);
+        // remaining ≈ (11-11 05:00 - 11-10 14:00) = 15 hours = 54000 s
+        assert!(info.remaining_seconds > 53990 && info.remaining_seconds <= 54000);
     }
 
     #[test]
@@ -170,25 +169,25 @@ mod tests {
 
     #[test]
     fn next_daily_run_utc_advances_correctly() {
-        // Before 02:00 → today's 02:00
-        let t = utc(2026, 11, 10, 1, 30, 0);
+        // Before 05:00 → today's 05:00
+        let t = utc(2026, 11, 10, 4, 30, 0);
         let next = next_daily_run_utc(t);
-        assert_eq!(next, utc(2026, 11, 10, 2, 0, 0));
+        assert_eq!(next, utc(2026, 11, 10, 5, 0, 0));
     }
 
     #[test]
     fn next_daily_run_utc_after_run_time_advances_to_tomorrow() {
-        // After 02:00 today → tomorrow's 02:00
+        // After 05:00 today → tomorrow's 05:00
         let t = utc(2026, 11, 10, 14, 30, 0);
         let next = next_daily_run_utc(t);
-        assert_eq!(next, utc(2026, 11, 11, 2, 0, 0));
+        assert_eq!(next, utc(2026, 11, 11, 5, 0, 0));
     }
 
     #[test]
     fn next_daily_run_utc_at_exact_run_time_advances_to_following_day() {
-        let t = utc(2026, 11, 10, 2, 0, 0);
+        let t = utc(2026, 11, 10, 5, 0, 0);
         let next = next_daily_run_utc(t);
-        assert_eq!(next, utc(2026, 11, 11, 2, 0, 0));
+        assert_eq!(next, utc(2026, 11, 11, 5, 0, 0));
     }
 
     #[test]

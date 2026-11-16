@@ -586,7 +586,7 @@ async fn handle_command(
 
                 response.push_str(&format!(
                     "\n🕒 <b>Daily Reset:</b> 00:00 UTC\n\
-                     ⏰ <b>Daily Run:</b> Batches of 100 / 5 min from 02:00 UTC"
+                     ⏰ <b>Daily Run:</b> Batches of 100 / 5 min from 05:00 UTC"
                 ));
 
                 bot.send_message(msg.chat.id, response)
