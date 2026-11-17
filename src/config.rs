@@ -9,6 +9,7 @@ pub struct Config {
     pub app_secret_key: [u8; 32],
     pub telegram_bot_token: Option<String>,
     pub admin_telegram_ids: Vec<i64>,
+    pub proxy_url: Option<String>,
 }
 
 impl Config {
@@ -48,6 +49,17 @@ impl Config {
             .filter_map(|value| value.trim().parse::<i64>().ok())
             .collect();
 
+        let proxy_url = env::var("PROXY_URL")
+            .ok()
+            .and_then(|val| {
+                let trimmed = val.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            });
+
         Ok(Self {
             server_host,
             server_port,
@@ -55,6 +67,7 @@ impl Config {
             app_secret_key,
             telegram_bot_token,
             admin_telegram_ids,
+            proxy_url,
         })
     }
 }

@@ -27,15 +27,26 @@ pub struct CreativeAwardsScraperEngine {
     pub base_url: String,
     pub default_nominee_id: String,
     pub default_category_id: String,
+    pub proxy_url: Option<String>,
     pub client: reqwest::Client,
 }
 
 impl CreativeAwardsScraperEngine {
-    pub fn new(nominee_id: Option<String>, category_id: Option<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
+    pub fn new(
+        nominee_id: Option<String>,
+        category_id: Option<String>,
+        proxy_url: Option<String>,
+    ) -> Self {
+        let mut client_builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30));
+
+        if let Some(ref proxy_str) = proxy_url {
+            if let Ok(proxy) = reqwest::Proxy::all(proxy_str) {
+                client_builder = client_builder.proxy(proxy);
+            }
+        }
+
+        let client = client_builder.build().unwrap_or_default();
 
         Self {
             base_url: "https://api.creativeawards.et".to_string(),
@@ -45,6 +56,7 @@ impl CreativeAwardsScraperEngine {
             // Yezemene Award category ID
             default_category_id: category_id
                 .unwrap_or_else(|| "01a0ecb7-741d-71b5-80cb-d80816db991f".to_string()),
+            proxy_url,
             client,
         }
     }
@@ -115,35 +127,72 @@ impl CreativeAwardsScraperEngine {
 #[async_trait]
 impl ScraperEngine for CreativeAwardsScraperEngine {
     async fn scrape(&self, session: &SessionPayload) -> Result<ScrapeResult, AppError> {
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(ORIGIN, HeaderValue::from_static("https://creativeawards.et"));
-        headers.insert(REFERER, HeaderValue::from_static("https://creativeawards.et/"));
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_static(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            ),
-        );
+        let mobile_ua = "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
 
-        // Inject the decrypted Bearer token
-        if let Some(token) = &session.token {
-            let auth_val = format!("Bearer {}", token);
-            if let Ok(val) = HeaderValue::from_str(&auth_val) {
-                headers.insert(AUTHORIZATION, val);
+        // Build a fresh, isolated HTTP client with its own cookie jar for this account
+        let mut client_builder = reqwest::Client::builder()
+            .cookie_store(true)
+            .timeout(Duration::from_secs(30));
+
+        if let Some(ref proxy_str) = self.proxy_url {
+            if let Ok(proxy) = reqwest::Proxy::all(proxy_str) {
+                client_builder = client_builder.proxy(proxy);
             }
-        } else {
-            return Err(AppError::Crypto("No auth token available in session".to_string()));
         }
 
-        tracing::info!(
-            "Automated Bot: Claiming +5 free votes for nominee {} in category {}...",
-            self.default_nominee_id,
-            self.default_category_id
-        );
+        let account_client = client_builder.build().unwrap_or_else(|_| self.client.clone());
 
         let mut sample_data = Vec::new();
+
+        // ---------------------------------------------------------------------
+        // Step 1: Google Search Simulation (Search for 'creative award')
+        // ---------------------------------------------------------------------
+        tracing::info!("Account vote journey: Step 1/4 - Google Search entry ('creative award')...");
+        let google_search_url = "https://www.google.com/search?q=creative+award";
+        let _ = account_client
+            .get(google_search_url)
+            .header(USER_AGENT, mobile_ua)
+            .header(
+                ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            )
+            .send()
+            .await;
+
+        // ---------------------------------------------------------------------
+        // Step 2: Land on Creative Awards from Google (Referer: https://www.google.com/)
+        // ---------------------------------------------------------------------
+        tracing::info!("Account vote journey: Step 2/4 - Landing on https://creativeawards.et/ from Google...");
+        let landing_res = account_client
+            .get("https://creativeawards.et/")
+            .header(USER_AGENT, mobile_ua)
+            .header(REFERER, "https://www.google.com/")
+            .header(
+                ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            )
+            .send()
+            .await;
+
+        if let Ok(resp) = landing_res {
+            sample_data.push(format!("Landing status: HTTP {}", resp.status()));
+        }
+
+        // ---------------------------------------------------------------------
+        // Step 3: View category & nominee card (Picture 1)
+        // ---------------------------------------------------------------------
+        tracing::info!("Account vote journey: Step 3/4 - Loading nominee & category details...");
+        let results_url = format!("{}/api/engage/results", self.base_url);
+        let _ = account_client
+            .get(&results_url)
+            .query(&[("category_id", &self.default_category_id)])
+            .header(ORIGIN, "https://creativeawards.et")
+            .header(REFERER, "https://creativeawards.et/")
+            .header(ACCEPT, "application/json")
+            .header(USER_AGENT, mobile_ua)
+            .send()
+            .await;
+
         let public_vote_count_before = match self
             .fetch_public_vote_count(&self.default_category_id, &self.default_nominee_id)
             .await
@@ -159,10 +208,36 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
             }
         };
 
-        // 1. Send the automated Claim Free Vote POST request
+        // ---------------------------------------------------------------------
+        // Step 4: Claim Free Vote (+5) with authenticated Bearer token
+        // ---------------------------------------------------------------------
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(ORIGIN, HeaderValue::from_static("https://creativeawards.et"));
+        headers.insert(REFERER, HeaderValue::from_static("https://creativeawards.et/"));
+        if let Ok(ua_val) = HeaderValue::from_str(mobile_ua) {
+            headers.insert(USER_AGENT, ua_val);
+        }
+
+        // Inject the decrypted Bearer token
+        if let Some(token) = &session.token {
+            let auth_val = format!("Bearer {}", token);
+            if let Ok(val) = HeaderValue::from_str(&auth_val) {
+                headers.insert(AUTHORIZATION, val);
+            }
+        } else {
+            return Err(AppError::Crypto("No auth token available in session".to_string()));
+        }
+
+        tracing::info!(
+            "Account vote journey: Step 4/4 - Claiming +5 free votes for nominee {} in category {}...",
+            self.default_nominee_id,
+            self.default_category_id
+        );
+
         let vote_url = format!("{}/api/engage/votes", self.base_url);
-        let vote_res = self
-            .client
+        let vote_res = account_client
             .post(&vote_url)
             .headers(headers.clone())
             .json(&ClaimVotePayload {

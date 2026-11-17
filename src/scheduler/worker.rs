@@ -7,19 +7,20 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
-/// Number of accounts to vote in each batch window.
-const BATCH_SIZE: usize = 100;
+/// Number of accounts to vote in each batch window (50 accounts for trial testing).
+const BATCH_SIZE: usize = 50;
 
 /// Gap between consecutive batches (5 minutes).
 const BATCH_INTERVAL_SECS: u64 = 5 * 60;
 
-/// Maximum concurrent voting tasks within a single batch of 100.
-/// 5 concurrent tasks ensure steady throughput (~20-30s for 100 accounts)
-/// without starving the 10-connection SQLite pool or tripping target server rate limits.
-const MAX_CONCURRENT_TASKS: usize = 5;
+/// Maximum concurrent voting tasks within a single batch.
+/// Sequential execution (1 account at a time) ensures natural human-like pacing.
+const MAX_CONCURRENT_TASKS: usize = 1;
+
+/// Natural human-like pause (in seconds) between consecutive accounts.
+const INTER_ACCOUNT_DELAY_SECS: u64 = 14;
 
 /// Starts the daily autonomous background scheduler.
 ///
@@ -176,30 +177,27 @@ async fn run_batched_daily_pass(
     }
 }
 
-/// Executes up to [`BATCH_SIZE`] accounts concurrently with bounded concurrency
-/// via a Tokio [`Semaphore`].
+/// Executes accounts sequentially with natural human-like delay between each account.
 async fn process_batch_concurrently(
     scraping_service: &Arc<ScrapingService>,
     accounts: Vec<PhoneAccount>,
 ) {
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TASKS));
-    let mut handles = Vec::with_capacity(accounts.len());
+    let total = accounts.len();
+    for (idx, account) in accounts.into_iter().enumerate() {
+        tracing::info!(
+            "Daily scheduler: Processing account {}/{} (ID #{}) with organic journey...",
+            idx + 1,
+            total,
+            account.id
+        );
+        process_account_once(scraping_service, account.id).await;
 
-    for account in accounts {
-        let svc = Arc::clone(scraping_service);
-        let sem = Arc::clone(&semaphore);
-        handles.push(tokio::spawn(async move {
-            let _permit = match sem.acquire().await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            process_account_once(&svc, account.id).await;
-        }));
-    }
-
-    for handle in handles {
-        if let Err(e) = handle.await {
-            tracing::error!("Daily scheduler: batch task panicked: {:?}", e);
+        if idx + 1 < total {
+            tracing::info!(
+                "Daily scheduler: Pacing pause ({}s) before next account...",
+                INTER_ACCOUNT_DELAY_SECS
+            );
+            sleep(Duration::from_secs(INTER_ACCOUNT_DELAY_SECS)).await;
         }
     }
 }
