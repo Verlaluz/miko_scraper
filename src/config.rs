@@ -10,6 +10,7 @@ pub struct Config {
     pub telegram_bot_token: Option<String>,
     pub admin_telegram_ids: Vec<i64>,
     pub proxy_url: Option<String>,
+    pub captcha_api_key: Option<String>,
 }
 
 impl Config {
@@ -60,6 +61,13 @@ impl Config {
                 }
             });
 
+        let captcha_api_key = env::var("TWO_CAPTCHA_API_KEY")
+            .ok()
+            .and_then(|val| {
+                let trimmed = val.trim().to_string();
+                if trimmed.is_empty() { None } else { Some(trimmed) }
+            });
+
         Ok(Self {
             server_host,
             server_port,
@@ -68,6 +76,7 @@ impl Config {
             telegram_bot_token,
             admin_telegram_ids,
             proxy_url,
+            captcha_api_key,
         })
     }
 }

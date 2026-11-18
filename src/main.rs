@@ -44,7 +44,7 @@ async fn main() -> Result<(), AppError> {
 
     // 4. Instantiate isolated pluggable components for creativeawards.et
     let otp_provider: Arc<dyn OtpProvider> = Arc::new(CreativeAwardsOtpProvider::new());
-    let scraper_engine: Arc<dyn ScraperEngine> = Arc::new(CreativeAwardsScraperEngine::new(None, None, config.proxy_url.clone()));
+    let scraper_engine: Arc<dyn ScraperEngine> = Arc::new(CreativeAwardsScraperEngine::new(None, None, config.proxy_url.clone(), config.captcha_api_key.clone()));
 
     // 5. Instantiate Service Layer
     let account_service = Arc::new(AccountService::new(

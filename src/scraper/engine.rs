@@ -28,6 +28,7 @@ pub struct CreativeAwardsScraperEngine {
     pub default_nominee_id: String,
     pub default_category_id: String,
     pub proxy_url: Option<String>,
+    pub captcha_api_key: Option<String>,
     pub client: reqwest::Client,
 }
 
@@ -36,6 +37,7 @@ impl CreativeAwardsScraperEngine {
         nominee_id: Option<String>,
         category_id: Option<String>,
         proxy_url: Option<String>,
+        captcha_api_key: Option<String>,
     ) -> Self {
         let mut client_builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30));
@@ -57,15 +59,72 @@ impl CreativeAwardsScraperEngine {
             default_category_id: category_id
                 .unwrap_or_else(|| "01a0ecb7-741d-71b5-80cb-d80816db991f".to_string()),
             proxy_url,
+            captcha_api_key,
             client,
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// 2captcha Turnstile solving structs
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct TwoCaptchaTask {
+    #[serde(rename = "type")]
+    task_type: String,
+    #[serde(rename = "websiteURL")]
+    website_url: String,
+    #[serde(rename = "websiteKey")]
+    website_key: String,
+}
+
+#[derive(Serialize)]
+struct TwoCaptchaCreateRequest {
+    #[serde(rename = "clientKey")]
+    client_key: String,
+    task: TwoCaptchaTask,
+}
+
+#[derive(Deserialize, Debug)]
+struct TwoCaptchaCreateResponse {
+    #[serde(rename = "errorId")]
+    error_id: i32,
+    #[serde(rename = "taskId")]
+    task_id: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct TwoCaptchaResultRequest {
+    #[serde(rename = "clientKey")]
+    client_key: String,
+    #[serde(rename = "taskId")]
+    task_id: u64,
+}
+
+#[derive(Deserialize, Debug)]
+struct TwoCaptchaSolution {
+    token: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct TwoCaptchaResultResponse {
+    #[serde(rename = "errorId")]
+    error_id: i32,
+    status: Option<String>,
+    solution: Option<TwoCaptchaSolution>,
+}
+
+// ---------------------------------------------------------------------------
+// Vote payload
+// ---------------------------------------------------------------------------
+
 #[derive(Serialize)]
 struct ClaimVotePayload {
     nominee_id: String,
     category_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turnstile_token: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -76,7 +135,118 @@ struct ClaimVoteResponse {
     funding_source: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// 2captcha helper implementation
+// ---------------------------------------------------------------------------
+
 impl CreativeAwardsScraperEngine {
+    /// Solves the Cloudflare Turnstile on creativeawards.et/login via 2captcha.
+    /// Returns the token string ready to inject into the vote payload.
+    async fn solve_turnstile(&self) -> Result<String, AppError> {
+        let api_key = self.captcha_api_key.as_ref().ok_or_else(|| {
+            AppError::Scraper("TWO_CAPTCHA_API_KEY is not configured".to_string())
+        })?;
+
+        // Use a plain (no-proxy) client for 2captcha API calls so we always
+        // reach their servers, even if the voting proxy is set.
+        let captcha_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap_or_default();
+
+        // Step A: Create the task
+        tracing::info!("2captcha: Submitting Turnstile task for creativeawards.et/login...");
+        let create_body = TwoCaptchaCreateRequest {
+            client_key: api_key.clone(),
+            task: TwoCaptchaTask {
+                task_type: "TurnstileTaskProxyless".to_string(),
+                website_url: "https://creativeawards.et/login".to_string(),
+                website_key: "0x4AAAAAAGE_S0okiKrjZxcj".to_string(),
+            },
+        };
+
+        let create_resp = captcha_client
+            .post("https://api.2captcha.com/createTask")
+            .json(&create_body)
+            .send()
+            .await
+            .map_err(|e| AppError::Scraper(format!("2captcha createTask network error: {}", e)))?;
+
+        let create_json: TwoCaptchaCreateResponse = create_resp
+            .json()
+            .await
+            .map_err(|e| AppError::Scraper(format!("2captcha createTask parse error: {}", e)))?;
+
+        if create_json.error_id != 0 {
+            return Err(AppError::Scraper(format!(
+                "2captcha createTask failed with errorId: {}",
+                create_json.error_id
+            )));
+        }
+
+        let task_id = create_json.task_id.ok_or_else(|| {
+            AppError::Scraper("2captcha createTask returned no taskId".to_string())
+        })?;
+
+        tracing::info!("2captcha: Task created (taskId={}). Polling for result...", task_id);
+
+        // Step B: Poll for result (every 5 seconds, up to 120 seconds)
+        let result_body = TwoCaptchaResultRequest {
+            client_key: api_key.clone(),
+            task_id,
+        };
+
+        let mut attempts = 0u32;
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            attempts += 1;
+
+            let result_resp = captcha_client
+                .post("https://api.2captcha.com/getTaskResult")
+                .json(&result_body)
+                .send()
+                .await
+                .map_err(|e| AppError::Scraper(format!("2captcha getTaskResult network error: {}", e)))?;
+
+            let result_json: TwoCaptchaResultResponse = result_resp
+                .json()
+                .await
+                .map_err(|e| AppError::Scraper(format!("2captcha getTaskResult parse error: {}", e)))?;
+
+            if result_json.error_id != 0 {
+                return Err(AppError::Scraper(format!(
+                    "2captcha getTaskResult errorId: {}",
+                    result_json.error_id
+                )));
+            }
+
+            match result_json.status.as_deref() {
+                Some("ready") => {
+                    let token = result_json
+                        .solution
+                        .and_then(|s| s.token)
+                        .ok_or_else(|| AppError::Scraper("2captcha solution token missing".to_string()))?;
+                    tracing::info!("2captcha: Turnstile token obtained after {}s ({} polls).", attempts * 5, attempts);
+                    return Ok(token);
+                }
+                Some("processing") => {
+                    tracing::debug!("2captcha: Still processing (attempt {}/24)...", attempts);
+                    if attempts >= 24 {
+                        return Err(AppError::Scraper(
+                            "2captcha timed out after 120s waiting for Turnstile token".to_string(),
+                        ));
+                    }
+                }
+                other => {
+                    return Err(AppError::Scraper(format!(
+                        "2captcha unexpected status: {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+    }
+
     async fn fetch_public_vote_count(
         &self,
         category_id: &str,
@@ -147,7 +317,7 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
         // ---------------------------------------------------------------------
         // Step 1: Google Search Simulation (Search for 'creative award')
         // ---------------------------------------------------------------------
-        tracing::info!("Account vote journey: Step 1/4 - Google Search entry ('creative award')...");
+        tracing::info!("Account vote journey: Step 1/5 - Google Search entry ('creative award')...");
         let google_search_url = "https://www.google.com/search?q=creative+award";
         let _ = account_client
             .get(google_search_url)
@@ -162,7 +332,7 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
         // ---------------------------------------------------------------------
         // Step 2: Land on Creative Awards from Google (Referer: https://www.google.com/)
         // ---------------------------------------------------------------------
-        tracing::info!("Account vote journey: Step 2/4 - Landing on https://creativeawards.et/ from Google...");
+        tracing::info!("Account vote journey: Step 2/5 - Landing on https://creativeawards.et/ from Google...");
         let landing_res = account_client
             .get("https://creativeawards.et/")
             .header(USER_AGENT, mobile_ua)
@@ -179,9 +349,9 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
         }
 
         // ---------------------------------------------------------------------
-        // Step 3: View category & nominee card (Picture 1)
+        // Step 3: View category & nominee card
         // ---------------------------------------------------------------------
-        tracing::info!("Account vote journey: Step 3/4 - Loading nominee & category details...");
+        tracing::info!("Account vote journey: Step 3/5 - Loading nominee & category details...");
         let results_url = format!("{}/api/engage/results", self.base_url);
         let _ = account_client
             .get(&results_url)
@@ -209,7 +379,30 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
         };
 
         // ---------------------------------------------------------------------
-        // Step 4: Claim Free Vote (+5) with authenticated Bearer token
+        // Step 4: Solve Cloudflare Turnstile via 2captcha
+        // ---------------------------------------------------------------------
+        let turnstile_token = if self.captcha_api_key.is_some() {
+            tracing::info!("Account vote journey: Step 4/5 - Solving Cloudflare Turnstile via 2captcha...");
+            match self.solve_turnstile().await {
+                Ok(token) => {
+                    sample_data.push("Turnstile token obtained from 2captcha.".to_string());
+                    Some(token)
+                }
+                Err(e) => {
+                    // Log but don't abort — try without token (may still fail with 422)
+                    tracing::warn!("2captcha solving failed: {}. Proceeding without token.", e);
+                    sample_data.push(format!("WARNING: 2captcha failed: {}", e));
+                    None
+                }
+            }
+        } else {
+            tracing::warn!("TWO_CAPTCHA_API_KEY not set — sending vote WITHOUT Turnstile token (expect 422).");
+            sample_data.push("No 2captcha key configured — voting without Turnstile token.".to_string());
+            None
+        };
+
+        // ---------------------------------------------------------------------
+        // Step 5: Claim Free Vote (+5) with authenticated Bearer token + turnstile_token
         // ---------------------------------------------------------------------
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -231,9 +424,10 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
         }
 
         tracing::info!(
-            "Account vote journey: Step 4/4 - Claiming +5 free votes for nominee {} in category {}...",
+            "Account vote journey: Step 5/5 - Claiming +5 free votes for nominee {} in category {} (turnstile={})...",
             self.default_nominee_id,
-            self.default_category_id
+            self.default_category_id,
+            turnstile_token.is_some()
         );
 
         let vote_url = format!("{}/api/engage/votes", self.base_url);
@@ -243,6 +437,7 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
             .json(&ClaimVotePayload {
                 nominee_id: self.default_nominee_id.clone(),
                 category_id: self.default_category_id.clone(),
+                turnstile_token,
             })
             .send()
             .await
@@ -279,8 +474,8 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
             let lower = body_text.to_lowercase();
             // CreativeAwards sends 409 Conflict when already voted today!
             if lower.contains("already cast")
-                || lower.contains("already claimed") 
-                || lower.contains("already voted") 
+                || lower.contains("already claimed")
+                || lower.contains("already voted")
             {
                 already_voted = true;
                 sample_data.push("Free vote was already cast for this nominee today. No new votes added; 12-hour cooldown retained.".to_string());
@@ -293,7 +488,7 @@ impl ScraperEngine for CreativeAwardsScraperEngine {
             }
         }
 
-        // 2. Fetch updated balance to verify
+        // Fetch updated balance to verify
         let balance_url = format!("{}/api/balance", self.base_url);
         if let Ok(bal_res) = self.client.get(&balance_url).headers(headers).send().await {
             if let Ok(bal_json) = bal_res.json::<serde_json::Value>().await {

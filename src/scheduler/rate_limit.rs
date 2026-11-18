@@ -8,7 +8,7 @@ pub const DAILY_RESET_MINUTE: u32 = 0;
 
 /// Fixed UTC time-of-day at which the daily run executes for all accounts.
 /// Configured to 05:00 UTC (08:00 AM Ethiopian Time EAT).
-pub const DAILY_RUN_HOUR: u32 = 5;
+pub const DAILY_RUN_HOUR: u32 = 1;
 pub const DAILY_RUN_MINUTE: u32 = 0;
 
 /// Minimum and maximum inter-record delay (seconds) during the daily run.
